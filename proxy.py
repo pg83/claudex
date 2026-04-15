@@ -11,14 +11,13 @@ Usage:
 """
 
 import argparse
-import copy
 import json
 import os
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional, Tuple, Union
+from typing import AsyncIterator, Optional, Union
 
 import httpx
 import uvicorn
@@ -28,6 +27,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+def env_bool(key: str) -> bool:
+    return os.environ.get(key, "").lower() in ("1", "true", "yes")
+
 
 CONFIG = {
     "openai_api_key": "",
@@ -76,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
-# ID helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -98,12 +101,33 @@ def to_openai_tool_id(anthropic_id: str) -> str:
     return anthropic_id
 
 
+def _strip_chat_suffix(url: str) -> str:
+    """Strip /chat/completions or /chat/completion to get the API root."""
+    base = url.rstrip("/")
+    for suffix in ("/chat/completions", "/chat/completion"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)].rstrip("/")
+    return base
+
+
+def extract_system_text(system) -> str:
+    """Extract plain text from Anthropic system param (string or block list)."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        return "\n\n".join(
+            block["text"] for block in system if block.get("type") == "text"
+        )
+    return str(system) if system else ""
+
+
 # ---------------------------------------------------------------------------
 # SSE formatting
 # ---------------------------------------------------------------------------
 
 
 def sse_event(event_type: str, data: dict) -> str:
+    data.setdefault("type", event_type)
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
@@ -237,32 +261,29 @@ def extract_tool_result_content(block) -> str:
 
 def convert_tools(anthropic_tools: list) -> list:
     """Anthropic flat tool defs -> OpenAI nested function defs."""
-    result = []
-    for tool in anthropic_tools:
-        result.append({
+    return [
+        {
             "type": "function",
             "function": {
                 "name": tool["name"],
                 "description": tool.get("description", ""),
                 "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
             },
-        })
-    return result
+        }
+        for tool in anthropic_tools
+    ]
+
+
+_TOOL_CHOICE_MAP = {"auto": "auto", "any": "required", "none": "none"}
 
 
 def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     if not isinstance(anthropic_tc, dict):
         return "auto"
     tc_type = anthropic_tc.get("type", "auto")
-    if tc_type == "auto":
-        return "auto"
-    if tc_type == "any":
-        return "required"
-    if tc_type == "none":
-        return "none"
     if tc_type == "tool":
         return {"type": "function", "function": {"name": anthropic_tc["name"]}}
-    return "auto"
+    return _TOOL_CHOICE_MAP.get(tc_type, "auto")
 
 
 def convert_request(body: dict) -> dict:
@@ -279,18 +300,9 @@ def convert_request(body: dict) -> dict:
     openai_messages: list[dict] = []
 
     # System prompt -> developer role message
-    system = body.get("system")
-    if system:
-        if isinstance(system, str):
-            system_text = system
-        elif isinstance(system, list):
-            system_text = "\n\n".join(
-                block["text"] for block in system if block.get("type") == "text"
-            )
-        else:
-            system_text = str(system)
-        if system_text:
-            openai_messages.append({"role": "developer", "content": system_text})
+    system_text = extract_system_text(body.get("system"))
+    if system_text:
+        openai_messages.append({"role": "developer", "content": system_text})
 
     # Convert messages
     for msg in body.get("messages", []):
@@ -473,14 +485,19 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def translate_error(status_code: int, openai_error: Optional[dict] = None) -> Tuple[int, dict]:
+def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={
+        "type": "error",
+        "error": {"type": etype, "message": message},
+    })
+
+
+def translate_openai_error(status_code: int, openai_error: Optional[dict] = None) -> JSONResponse:
+    """Translate an OpenAI HTTP error into an Anthropic-format error response."""
     error_msg = "Unknown error"
     if openai_error and "error" in openai_error:
         err = openai_error["error"]
-        if isinstance(err, dict):
-            error_msg = err.get("message", str(err))
-        else:
-            error_msg = str(err)
+        error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
 
     if status_code == 429:
         etype = "rate_limit_error"
@@ -493,7 +510,7 @@ def translate_error(status_code: int, openai_error: Optional[dict] = None) -> Tu
         status_code = 400
         etype = "invalid_request_error"
 
-    return status_code, {"type": "error", "error": {"type": etype, "message": error_msg}}
+    return error_response(status_code, etype, error_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -537,24 +554,35 @@ class StreamState:
 
 def close_block_events(state: StreamState) -> list[str]:
     """Return SSE strings to close the current content block."""
-    events: list[str] = []
     if state.current_block_type is None:
-        return events
+        return []
 
+    events: list[str] = []
     if state.current_block_type == "thinking":
         events.append(sse_event("content_block_delta", {
-            "type": "content_block_delta",
             "index": state.block_index,
             "delta": {"type": "signature_delta", "signature": ""},
         }))
 
     events.append(sse_event("content_block_stop", {
-        "type": "content_block_stop",
         "index": state.block_index,
     }))
     state.block_index += 1
     state.current_block_type = None
     state.current_tool_index = None
+    return events
+
+
+def open_block_events(state: StreamState, block_type: str, content_block: dict) -> list[str]:
+    """Close previous block if needed, then open a new one. Returns SSE strings."""
+    if state.current_block_type == block_type:
+        return []
+    events = close_block_events(state)
+    state.current_block_type = block_type
+    events.append(sse_event("content_block_start", {
+        "index": state.block_index,
+        "content_block": content_block,
+    }))
     return events
 
 
@@ -568,7 +596,6 @@ async def stream_translate(
 
     # message_start
     yield sse_event("message_start", {
-        "type": "message_start",
         "message": {
             "id": state.message_id,
             "type": "message",
@@ -581,7 +608,7 @@ async def stream_translate(
         },
     })
 
-    yield sse_event("ping", {"type": "ping"})
+    yield sse_event("ping", {})
 
     finish_reason = None
     _chunk_count = 0
@@ -589,13 +616,11 @@ async def stream_translate(
     try:
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
-                if CONFIG["debug"]:
-                    debug_sse("in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
+                debug_sse("in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
                 break
 
             _chunk_count += 1
-            if CONFIG["debug"]:
-                debug_sse("in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
+            debug_sse("in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
             if choices:
@@ -608,17 +633,9 @@ async def stream_translate(
                 # --- Reasoning content ---
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
-                    if state.current_block_type != "thinking":
-                        for ev in close_block_events(state):
-                            yield ev
-                        state.current_block_type = "thinking"
-                        yield sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": state.block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        })
+                    for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
+                        yield ev
                     yield sse_event("content_block_delta", {
-                        "type": "content_block_delta",
                         "index": state.block_index,
                         "delta": {"type": "thinking_delta", "thinking": reasoning},
                     })
@@ -626,17 +643,9 @@ async def stream_translate(
                 # --- Text content ---
                 text = delta.get("content")
                 if text:
-                    if state.current_block_type != "text":
-                        for ev in close_block_events(state):
-                            yield ev
-                        state.current_block_type = "text"
-                        yield sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": state.block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        })
+                    for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
+                        yield ev
                     yield sse_event("content_block_delta", {
-                        "type": "content_block_delta",
                         "index": state.block_index,
                         "delta": {"type": "text_delta", "text": text},
                     })
@@ -647,32 +656,19 @@ async def stream_translate(
                     for tc_delta in tc_deltas:
                         tc_idx = tc_delta.get("index", 0)
 
-                        # New tool call?
                         if tc_idx != state.current_tool_index:
-                            for ev in close_block_events(state):
-                                yield ev
-
                             tool_id = to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
                             tool_name = tc_delta.get("function", {}).get("name", "")
-
-                            state.current_block_type = "tool_use"
+                            for ev in open_block_events(state, "tool_use", {
+                                "type": "tool_use", "id": tool_id, "name": tool_name, "input": {},
+                            }):
+                                yield ev
                             state.current_tool_index = tc_idx
-                            yield sse_event("content_block_start", {
-                                "type": "content_block_start",
-                                "index": state.block_index,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": tool_id,
-                                    "name": tool_name,
-                                    "input": {},
-                                },
-                            })
 
                         # Stream arguments as input_json_delta
                         args_chunk = tc_delta.get("function", {}).get("arguments", "")
                         if args_chunk:
                             yield sse_event("content_block_delta", {
-                                "type": "content_block_delta",
                                 "index": state.block_index,
                                 "delta": {"type": "input_json_delta", "partial_json": args_chunk},
                             })
@@ -692,12 +688,11 @@ async def stream_translate(
     # message_delta with stop reason
     stop_reason = FINISH_REASON_MAP.get(finish_reason, "end_turn")
     yield sse_event("message_delta", {
-        "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
         "usage": {"output_tokens": state.output_tokens},
     })
 
-    yield sse_event("message_stop", {"type": "message_stop"})
+    yield sse_event("message_stop", {})
 
     debug_log("STREAM COMPLETE", req_id=req_id,
               chunks=_chunk_count,
@@ -717,11 +712,7 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
         "Authorization": f"Bearer {CONFIG['openai_api_key']}",
         "Content-Type": "application/json",
     }
-    base = CONFIG['openai_base_url'].rstrip('/')
-    if base.endswith("/chat/completions") or base.endswith("/chat/completion"):
-        url = base
-    else:
-        url = f"{base}/chat/completions"
+    url = _strip_chat_suffix(CONFIG['openai_base_url']) + "/chat/completions"
 
     if stream:
         req = http_client.build_request("POST", url, json=openai_body, headers=headers)
@@ -764,10 +755,7 @@ async def create_message(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": "Invalid JSON body"},
-        })
+        return error_response(400, "invalid_request_error", "Invalid JSON body")
 
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
@@ -780,10 +768,7 @@ async def create_message(request: Request):
     try:
         openai_body = convert_request(body)
     except Exception as e:
-        return JSONResponse(status_code=400, content={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": f"Request conversion error: {e}"},
-        })
+        return error_response(400, "invalid_request_error", f"Request conversion error: {e}")
 
     debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
               model=openai_body.get("model", ""),
@@ -815,14 +800,10 @@ async def create_message(request: Request):
         except Exception:
             error_body = None
         debug_log("OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
-        status, err = translate_error(e.response.status_code, error_body)
-        return JSONResponse(status_code=status, content=err)
+        return translate_openai_error(e.response.status_code, error_body)
     except Exception as e:
         debug_log("PROXY ERROR", {"error": str(e)}, req_id=req_id)
-        return JSONResponse(status_code=500, content={
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        })
+        return error_response(500, "api_error", str(e))
 
 
 @app.post("/v1/messages/count_tokens")
@@ -835,12 +816,7 @@ async def count_tokens(request: Request):
     total_chars = 0
 
     # System prompt
-    system = body.get("system", "")
-    if isinstance(system, str):
-        total_chars += len(system)
-    elif isinstance(system, list):
-        for block in system:
-            total_chars += len(block.get("text", ""))
+    total_chars += len(extract_system_text(body.get("system")))
 
     # Messages
     for msg in body.get("messages", []):
@@ -904,20 +880,14 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--no-ssl-verify",
         action="store_true",
-        default=os.environ.get("NO_SSL_VERIFY", "").lower() in ("1", "true", "yes"),
+        default=env_bool("NO_SSL_VERIFY"),
         help="Disable SSL certificate verification for upstream",
     )
 
 
 def _get_models_url(base_url: str) -> str:
     """Derive /models endpoint from the configured base URL."""
-    base = base_url.rstrip("/")
-    # Strip /chat/completions(s) suffix to get the API root
-    for suffix in ("/chat/completions", "/chat/completion"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)].rstrip("/")
-            break
-    return f"{base}/models"
+    return _strip_chat_suffix(base_url) + "/models"
 
 
 def cmd_models(args: argparse.Namespace):
@@ -1040,7 +1010,7 @@ def main():
     p_serve.add_argument(
         "--debug",
         action="store_true",
-        default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
+        default=env_bool("DEBUG"),
         help="Enable debug logging of all requests/responses to stderr",
     )
 
