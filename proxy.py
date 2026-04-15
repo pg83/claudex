@@ -46,7 +46,10 @@ http_client: httpx.AsyncClient = None  # type: ignore[assignment]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0, connect=10.0),
+        verify=not CONFIG.get("no_ssl_verify", False),
+    )
     yield
     await http_client.aclose()
 
@@ -454,7 +457,11 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
 def translate_error(status_code: int, openai_error: Optional[dict] = None) -> Tuple[int, dict]:
     error_msg = "Unknown error"
     if openai_error and "error" in openai_error:
-        error_msg = openai_error["error"].get("message", error_msg)
+        err = openai_error["error"]
+        if isinstance(err, dict):
+            error_msg = err.get("message", str(err))
+        else:
+            error_msg = str(err)
 
     if status_code == 429:
         etype = "rate_limit_error"
@@ -691,7 +698,11 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
         "Authorization": f"Bearer {CONFIG['openai_api_key']}",
         "Content-Type": "application/json",
     }
-    url = f"{CONFIG['openai_base_url'].rstrip('/')}/chat/completions"
+    base = CONFIG['openai_base_url'].rstrip('/')
+    if base.endswith("/chat/completions") or base.endswith("/chat/completion"):
+        url = base
+    else:
+        url = f"{base}/chat/completions"
 
     if stream:
         req = http_client.build_request("POST", url, json=openai_body, headers=headers)
@@ -708,7 +719,11 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
     else:
         resp = await http_client.post(url, json=openai_body, headers=headers)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # Unwrap provider wrappers (e.g. Yandex Eliza: {"response": {...actual...}})
+        if "response" in data and "choices" not in data:
+            data = data["response"]
+        return data
 
 
 async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncIterator[str]:
@@ -877,6 +892,12 @@ def main():
         help="Model mapping pairs, e.g. claude-sonnet-4-6=gpt-5.4",
     )
     parser.add_argument(
+        "--no-ssl-verify",
+        action="store_true",
+        default=os.environ.get("NO_SSL_VERIFY", "").lower() in ("1", "true", "yes"),
+        help="Disable SSL certificate verification for upstream",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
@@ -891,16 +912,20 @@ def main():
     CONFIG["openai_base_url"] = args.openai_base_url
     CONFIG["default_model"] = args.default_model
     CONFIG["debug"] = args.debug
+    CONFIG["no_ssl_verify"] = args.no_ssl_verify
 
     # Default model map
+    default = args.default_model
     MODEL_MAP.update({
-        "claude-opus-4-6": args.default_model,
-        "claude-sonnet-4-6": args.default_model,
-        "claude-sonnet-4-5-20250514": args.default_model,
-        "claude-sonnet-4-20250514": args.default_model,
-        "claude-3-5-sonnet-20241022": args.default_model,
-        "claude-3-5-haiku-20241022": args.default_model,
-        "claude-haiku-4-5": args.default_model,
+        "claude-opus-4-6": default,
+        "claude-sonnet-4-6": default,
+        "claude-sonnet-4-5-20250514": default,
+        "claude-sonnet-4-20250514": default,
+        "claude-3-5-sonnet-20241022": default,
+        "claude-3-5-haiku-20241022": default,
+        "claude-haiku-4-5": default,
+        # Full-qualified OpenRouter names
+        "claude-haiku-4-5-20241022": default,
     })
 
     # Custom model mappings from CLI
