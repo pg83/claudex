@@ -198,7 +198,7 @@ def sse_event(event_type: str, data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Debug logging (JSONL to stderr)
+# Logging: info (stderr, always on) and debug (stdout JSONL, opt-in)
 # ---------------------------------------------------------------------------
 
 _REQ_COUNTER = 0
@@ -210,27 +210,23 @@ def _next_req_id() -> str:
     return f"#{_REQ_COUNTER:04d}"
 
 
-def _truncate_obj(obj, depth: int = 0):
-    """Deep-copy obj with large strings truncated for logging."""
-    if depth > 20:
-        return "...[depth limit]"
-    if isinstance(obj, str):
-        if len(obj) > 200 and (obj[:20].replace("+", "").replace("/", "").replace("=", "").isalnum()):
-            return obj[:50] + f"...[base64, {len(obj)} chars]"
-        if len(obj) > 500:
-            return obj[:500] + f"...[{len(obj)} chars]"
-        return obj
-    if isinstance(obj, dict):
-        return {k: _truncate_obj(v, depth + 1) for k, v in obj.items()}
-    if isinstance(obj, list):
-        if len(obj) > 30:
-            return [_truncate_obj(x, depth + 1) for x in obj[:10]] + [f"...[{len(obj)} items]"]
-        return [_truncate_obj(x, depth + 1) for x in obj]
-    return obj
+def log(msg: str, req_id: str = ""):
+    """Write a short INFO line to stderr (always visible)."""
+    ts = time.strftime("%H:%M:%S")
+    prefix = f"{ts} {req_id} " if req_id else f"{ts} "
+    print(f"{prefix}{msg}", file=sys.stderr, flush=True)
+
+
+def _human_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f}KB"
+    return f"{n/1024/1024:.1f}MB"
 
 
 def debug_log(event: str, data=None, req_id: str = "", **extra):
-    """Write one JSONL line to stderr."""
+    """Write one JSONL line to stdout (redirect with > debug.jsonl)."""
     if not CONFIG["debug"]:
         return
     record = {"ts": time.strftime("%H:%M:%S"), "event": event}
@@ -238,13 +234,12 @@ def debug_log(event: str, data=None, req_id: str = "", **extra):
         record["req"] = req_id
     record.update(extra)
     if data is not None:
-        record["data"] = _truncate_obj(data)
-    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
-    sys.stderr.flush()
+        record["data"] = data
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 def debug_sse(direction: str, event_str: str, req_id: str = ""):
-    """Log a single SSE chunk as one JSONL line."""
+    """Log a single SSE chunk as one JSONL line to stdout."""
     if not CONFIG["debug"]:
         return
     lines = event_str.strip().split("\n")
@@ -267,8 +262,7 @@ def debug_sse(direction: str, event_str: str, req_id: str = ""):
         record["sse_type"] = etype
     if edata:
         record["sse_data"] = edata
-    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
-    sys.stderr.flush()
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +637,7 @@ async def stream_translate(
 
     finish_reason = None
     _chunk_count = 0
+    _raw_chunks = []
 
     try:
         async for chunk in iter_openai_sse(openai_response):
@@ -651,6 +646,7 @@ async def stream_translate(
                 break
 
             _chunk_count += 1
+            _raw_chunks.append(chunk)
             debug_sse("in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
@@ -723,9 +719,10 @@ async def stream_translate(
 
     yield sse_event("message_stop", {})
 
-    debug_log("STREAM COMPLETE", req_id=req_id,
+    log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
+        req_id=req_id)
+    debug_log("OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
               chunks=_chunk_count,
-              blocks=state.block_index,
               stop=stop_reason,
               input_tokens=state.input_tokens,
               output_tokens=state.output_tokens)
@@ -776,74 +773,28 @@ async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncItera
 # ---------------------------------------------------------------------------
 
 COMPRESS_PROMPT = (
-    "Summarize this conversation between a user and an AI coding assistant. "
-    "Preserve: what was asked, what files were read or changed, what tools were "
-    "called and their key results, decisions made, current state of the task. "
-    "Be concise but complete enough that the assistant can continue the work. "
+    "You are a context compressor. You received a JSON array of conversation messages. "
+    "Your ONLY job is to retell what happened in the conversation turn by turn. "
+    "Do NOT analyze, critique, or suggest improvements to any code you see. "
+    "Do NOT write code. Do NOT offer opinions.\n\n"
+    "For each turn, write:\n"
+    "- What the user asked or said\n"
+    "- What the assistant did (which files it read/wrote, what tools it called, what it responded)\n"
+    "- Key results, errors, decisions\n\n"
+    "Preserve file paths, function names, specific values, and code snippets that are important for context. "
+    "A new assistant will use your summary to continue the conversation, so do not lose any context. "
     "Output only the summary, no preamble."
 )
 
 
-def _has_block_type(content, btype: str) -> bool:
-    if not isinstance(content, list):
-        return False
-    return any(b.get("type") == btype for b in content)
-
-
-def find_safe_split(messages: list, keep: int) -> int:
-    """Find split point that doesn't break tool_use -> tool_result chains."""
-    boundary = len(messages) - keep
-    if boundary < 2:
-        return 0
-    for i in range(boundary, 1, -1):
-        msg = messages[i]
-        content = msg.get("content", "")
-        if msg["role"] == "user" and _has_block_type(content, "tool_result"):
-            continue
-        return i
-    return 0
-
-
-def _truncate(s: str, limit: int = 500) -> str:
-    return s if len(s) <= limit else s[:limit] + f"...[{len(s)} chars]"
 
 
 def serialize_messages(messages: list) -> str:
-    """Serialize Anthropic messages to a readable text format for compression."""
-    lines = []
-    for msg in messages:
-        role = msg["role"].upper()
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            lines.append(f"{role}: {_truncate(content)}")
-        elif isinstance(content, list):
-            parts = []
-            for block in content:
-                btype = block.get("type", "")
-                if btype == "text":
-                    parts.append(_truncate(block.get("text", "")))
-                elif btype == "tool_use":
-                    inp = json.dumps(block.get("input", {}))
-                    parts.append(f"[tool_use: {block.get('name', '?')}({_truncate(inp, 200)})]")
-                elif btype == "tool_result":
-                    sub = block.get("content", "")
-                    if isinstance(sub, str):
-                        text = sub
-                    elif isinstance(sub, list):
-                        text = " ".join(b.get("text", "") for b in sub if b.get("type") == "text")
-                    else:
-                        text = str(sub)
-                    status = "error" if block.get("is_error") else "ok"
-                    parts.append(f"[tool_result({status}): {_truncate(text, 300)}]")
-                elif btype == "thinking":
-                    parts.append(f"[thinking: {_truncate(block.get('thinking', ''), 200)}]")
-            lines.append(f"{role}: {' '.join(parts)}")
-        else:
-            lines.append(f"{role}: {_truncate(str(content))}")
-    return "\n".join(lines)
+    """Serialize Anthropic messages to JSON for compression."""
+    return json.dumps(messages, ensure_ascii=False)
 
 
-async def call_compress_llm(messages: list) -> str:
+async def call_compress_llm(messages: list, req_id: str = "") -> str:
     """Send messages to the compression model and return summary text."""
     ep = resolve_endpoint("compress")
     serialized = serialize_messages(messages)
@@ -851,13 +802,17 @@ async def call_compress_llm(messages: list) -> str:
     compress_body = {
         "model": ep["model"],
         "messages": [
-            {"role": "developer", "content": COMPRESS_PROMPT},
             {"role": "user", "content": f"<conversation>\n{serialized}\n</conversation>"},
+            {"role": "assistant", "content": "I've read the conversation log. What should I do with it?"},
+            {"role": "user", "content": COMPRESS_PROMPT},
         ],
-        "max_tokens": 2048,
+        "max_tokens": max(4096, len(serialized) // 4),
         "temperature": 0,
         "stream": False,
+        "full": messages,
     }
+
+    debug_log("COMPRESS_REQ", compress_body, req_id=req_id)
 
     headers = {
         "Authorization": f"Bearer {ep['api_key']}",
@@ -871,46 +826,82 @@ async def call_compress_llm(messages: list) -> str:
     if "response" in data and "choices" not in data:
         data = data["response"]
 
+    debug_log("COMPRESS_RESP", data, req_id=req_id)
+
     return data["choices"][0]["message"]["content"] or ""
 
 
+def _collapse_messages(messages: list) -> list:
+    """Collapse old messages: join adjacent user text, preserve tool_use->tool_result pairs."""
+    result = []
+    user_text = []
+
+    def flush_user_text():
+        if user_text:
+            result.append({"role": "user", "content": "\n\n".join(user_text)})
+            user_text.clear()
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+
+        if role == "user":
+            if isinstance(content, str):
+                if content.strip():
+                    user_text.append(content)
+            elif isinstance(content, list):
+                has_tool_result = any(b.get("type") == "tool_result" for b in content)
+                if has_tool_result:
+                    flush_user_text()
+                    result.append(msg)
+                else:
+                    for block in content:
+                        if block.get("type") == "text" and block.get("text", "").strip():
+                            user_text.append(block["text"])
+
+        elif role == "assistant":
+            flush_user_text()
+            if isinstance(content, str):
+                if content.strip():
+                    result.append(msg)
+            elif isinstance(content, list):
+                blocks = [b for b in content if b.get("type") != "thinking"]
+                if blocks:
+                    result.append({"role": "assistant", "content": blocks})
+
+    flush_user_text()
+    return result
+
+
 async def compress_context(messages: list, req_id: str = "") -> list:
-    """Compress old messages via cheap LLM, keeping recent ones verbatim."""
+    """Collapse old messages into flat user/assistant/tools, keeping recent ones verbatim."""
     keep = CONFIG["compress_keep"]
     min_msgs = CONFIG["compress_min"]
 
     if len(messages) < min_msgs:
         return messages
 
-    split = find_safe_split(messages, keep)
-    if split <= 0:
+    split = len(messages) - keep
+    if split < 2:
         return messages
 
-    to_compress = messages[:split]
+    to_collapse = messages[:split]
     tail = messages[split:]
 
-    original_chars = sum(len(json.dumps(m.get("content", ""))) for m in messages)
+    collapsed = _collapse_messages(to_collapse)
+    compressed = [*collapsed, *tail]
 
-    ep = resolve_endpoint("compress")
-    try:
-        summary = await call_compress_llm(to_compress)
-    except Exception as e:
-        debug_log("COMPRESS ERROR", {"error": str(e)}, req_id=req_id)
-        return messages
-
-    compressed = [
-        {"role": "user", "content": f"<context-summary>\n{summary}\n</context-summary>"},
-        {"role": "assistant", "content": "Understood, I have the conversation context."},
-        *tail,
-    ]
-
-    debug_log("CONTEXT COMPRESSION", req_id=req_id,
+    original_total = len(json.dumps(messages, ensure_ascii=False))
+    compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
+    ratio = original_total / compressed_bytes if compressed_bytes else 0
+    log(f"compress {len(messages)}→{len(compressed)} msgs, {_human_bytes(original_total)}→{_human_bytes(compressed_bytes)}, {ratio:.1f}x",
+        req_id=req_id)
+    debug_log("CONTEXT COMPRESSION", compressed, req_id=req_id,
               original_msgs=len(messages),
               compressed_to=len(compressed),
               kept_verbatim=len(tail),
-              original_chars=original_chars,
-              summary_chars=len(summary),
-              model=ep["model"])
+              original_total=original_total,
+              compressed_bytes=compressed_bytes)
 
     return compressed
 
@@ -932,12 +923,18 @@ async def create_message(request: Request):
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
     ep = resolve_endpoint(anthropic_model)
+    n_msgs = len(body.get("messages", []))
+    n_tools = len(body.get("tools", []))
+    body_bytes = len(json.dumps(body))
+    stream_tag = "stream" if is_stream else "sync"
+
+    log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {_human_bytes(body_bytes)}, {stream_tag}",
+        req_id=req_id)
 
     debug_log("ANTHROPIC REQUEST", body, req_id=req_id,
               model=anthropic_model, stream=is_stream,
               endpoint_model=ep["model"],
-              messages=len(body.get("messages", [])),
-              tools=len(body.get("tools", [])))
+              messages=n_msgs, tools=n_tools)
 
     # Context compression
     if "compress" in ENDPOINTS and "messages" in body:
@@ -971,6 +968,9 @@ async def create_message(request: Request):
             debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
                       finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
             anthropic_resp = convert_response(openai_resp, anthropic_model)
+            usage = anthropic_resp.get("usage", {})
+            log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
+                req_id=req_id)
             debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
                       stop=anthropic_resp.get("stop_reason"))
             return JSONResponse(content=anthropic_resp)
@@ -980,9 +980,11 @@ async def create_message(request: Request):
             error_body = e.response.json()
         except Exception:
             error_body = None
+        log(f"ERROR {e.response.status_code}", req_id=req_id)
         debug_log("OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
         return translate_openai_error(e.response.status_code, error_body)
     except Exception as e:
+        log(f"ERROR {e}", req_id=req_id)
         debug_log("PROXY ERROR", {"error": str(e)}, req_id=req_id)
         return error_response(500, "api_error", str(e))
 
@@ -1059,7 +1061,7 @@ def cmd_serve(args: argparse.Namespace):
     if "compress" in ENDPOINTS:
         print(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
     if CONFIG["debug"]:
-        print("Debug: ENABLED (JSONL to stderr)")
+        print("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
     print()
     print("Usage:")
     print(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
@@ -1105,6 +1107,20 @@ def cmd_models(args: argparse.Namespace):
         print(f"  {mid}{extra}")
 
 
+def cmd_anal(args: argparse.Namespace):
+    """Analyze debug log: pretty-print all events."""
+    for line in open(args.log):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        print(json.dumps(ev, indent=2, ensure_ascii=False))
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Anthropic -> OpenAI proxy")
     sub = parser.add_subparsers(dest="command")
@@ -1117,12 +1133,17 @@ def main():
     p_models = sub.add_parser("models", help="List models at first configured endpoint")
     p_models.add_argument("config", help="Path to config.json")
 
+    p_anal = sub.add_parser("anal", help="Analyze debug log")
+    p_anal.add_argument("log", help="Path to debug log file")
+
     args = parser.parse_args()
 
     if args.command == "serve":
         cmd_serve(args)
     elif args.command == "models":
         cmd_models(args)
+    elif args.command == "anal":
+        cmd_anal(args)
     else:
         parser.print_help()
 
