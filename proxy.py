@@ -25,6 +25,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from rag import RAG
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -47,6 +49,7 @@ FALLBACK_CHAIN = {
 }
 
 http_client: httpx.AsyncClient = None  # type: ignore[assignment]
+rag_instance: RAG = None  # type: ignore[assignment]
 
 
 def _expand_env(s: str) -> str:
@@ -78,6 +81,18 @@ def load_config(path: str):
     CONFIG["compress_keep"] = cfg.get("compress_keep", 4)
     CONFIG["compress_min"] = cfg.get("compress_min", 8)
     CONFIG["debug"] = cfg.get("debug", False)
+
+    # RAG settings
+    raw = cfg.get("rag_dir")
+    if isinstance(raw, str):
+        CONFIG["rag_dirs"] = [raw]
+    elif isinstance(raw, list):
+        CONFIG["rag_dirs"] = raw
+    else:
+        CONFIG["rag_dirs"] = []
+    CONFIG["rag_extensions"] = cfg.get("rag_extensions")
+    CONFIG["rag_max_results"] = cfg.get("rag_max_results", 3)
+    CONFIG["rag_chunk_size"] = cfg.get("rag_chunk_size", 2000)
 
     # Endpoints
     for role, ep in cfg.get("endpoints", {}).items():
@@ -215,6 +230,31 @@ def log(msg: str, req_id: str = ""):
     ts = time.strftime("%H:%M:%S")
     prefix = f"{ts} {req_id} " if req_id else f"{ts} "
     print(f"{prefix}{msg}", file=sys.stderr, flush=True)
+
+
+def _extract_msg_text(msg: dict) -> str:
+    """Extract all text content from a message."""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+        return " ".join(texts)
+    return ""
+
+
+def _extract_last_user_text(messages: list) -> str:
+    """Get text from the last user message."""
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+            return " ".join(texts)
+    return ""
 
 
 def _human_bytes(n: int) -> str:
@@ -1058,6 +1098,35 @@ async def create_message(request: Request):
     if "compress" in ENDPOINTS and "messages" in body:
         body["messages"] = await compress_context(body["messages"], req_id=req_id)
 
+    # RAG: index incoming messages, then search
+    if rag_instance is not None:
+        for msg in body.get("messages", []):
+            text = _extract_msg_text(msg)
+            if text:
+                rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, CONFIG.get("rag_chunk_size", 2000))
+        last_text = _extract_last_user_text(body.get("messages", []))
+        if last_text:
+            rag_results = rag_instance.search(last_text, CONFIG.get("rag_max_results", 3))
+            if rag_results:
+                rag_block = "\n".join(
+                    f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
+                    for r in rag_results
+                )
+                # Append RAG context to the last user message
+                messages = body.get("messages", [])
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+                        if isinstance(content, str):
+                            msg["content"] = content + suffix
+                        elif isinstance(content, list):
+                            content.append({"type": "text", "text": suffix})
+                        break
+                hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
+                log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
+                debug_log("RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+
     try:
         openai_body = convert_request(body, ep["model"])
     except Exception as e:
@@ -1206,17 +1275,29 @@ def cmd_serve(args: argparse.Namespace):
     host = CONFIG.get("host", "127.0.0.1")
     port = CONFIG.get("port", 8082)
 
-    print(f"Proxy starting on {host}:{port}")
-    print("Endpoints:")
+    def info(msg): print(msg, file=sys.stderr, flush=True)
+
+    info(f"Proxy starting on {host}:{port}")
+    info("Endpoints:")
     for role, ep in ENDPOINTS.items():
-        print(f"  {role}: {ep['base_url']} -> {ep['model']}")
+        info(f"  {role}: {ep['base_url']} -> {ep['model']}")
     if "compress" in ENDPOINTS:
-        print(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
+        info(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
+
+    global rag_instance
+    rag_dirs = CONFIG.get("rag_dirs", [])
+    if rag_dirs:
+        exts = CONFIG.get("rag_extensions")
+        chunk_size = CONFIG.get("rag_chunk_size", 2000)
+        dirs = [os.path.expanduser(d) for d in rag_dirs]
+        rag_instance = RAG(dirs, set(exts) if exts else None, chunk_size)
+        info(f"RAG: {rag_instance.n_files} files, {rag_instance.n_chunks} chunks from {', '.join(dirs)}")
+
     if CONFIG["debug"]:
-        print("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
-    print()
-    print("Usage:")
-    print(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
+        info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
+    info("")
+    info("Usage:")
+    info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 

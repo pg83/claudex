@@ -3,24 +3,24 @@
   "listen": "127.0.0.1:18080",
 
   "endpoints": {
-    "compress": {
+    "compress1": {
       "base_url": "https://api.eliza.yandex.net/internal/glm-latest/v1",
       "model": "/genesis/model"
     },
-    "haiku": {
-      "base_url": "https://api.eliza.yandex.net/internal/glm-latest/v1",
-      "model": "/genesis/model"
+    "compress2": {
+      "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
+      "model": "google/gemini-2.5-flash-lite"
     },
     "opus": {
       "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
       "model": "openai/gpt-4.1-nano"
-    },
-    "sonnet": {
-      "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
-      "model": "google/gemini-2.5-flash-lite"
     }
   },
 
   "compress_keep": 4,
-  "compress_min": 8
+  "compress_min": 8,
+
+  "rag_dir": ["./", "/home/pg/std"],
+  "rag_max_results": 3,
+  "rag_chunk_size": 2000
 }
