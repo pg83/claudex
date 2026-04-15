@@ -761,11 +761,129 @@ async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: s
         return data
 
 
+async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> AsyncIterator[str]:
+    """Emit Anthropic SSE events from a completed sync response."""
+    yield sse_event("message_start", {"message": {
+        "id": anthropic_resp.get("id", gen_message_id()),
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": anthropic_resp.get("model", ""),
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }})
+    yield sse_event("ping", {})
+
+    for idx, block in enumerate(anthropic_resp.get("content", [])):
+        btype = block.get("type", "text")
+        if btype == "text":
+            yield sse_event("content_block_start", {
+                "index": idx, "content_block": {"type": "text", "text": ""},
+            })
+            yield sse_event("content_block_delta", {
+                "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")},
+            })
+            yield sse_event("content_block_stop", {"index": idx})
+        elif btype == "thinking":
+            yield sse_event("content_block_start", {
+                "index": idx, "content_block": {"type": "thinking", "thinking": ""},
+            })
+            yield sse_event("content_block_delta", {
+                "index": idx, "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")},
+            })
+            yield sse_event("content_block_delta", {
+                "index": idx, "delta": {"type": "signature_delta", "signature": ""},
+            })
+            yield sse_event("content_block_stop", {"index": idx})
+        elif btype == "tool_use":
+            yield sse_event("content_block_start", {
+                "index": idx, "content_block": {
+                    "type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {},
+                },
+            })
+            yield sse_event("content_block_delta", {
+                "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}))},
+            })
+            yield sse_event("content_block_stop", {"index": idx})
+
+    yield sse_event("message_delta", {
+        "delta": {"stop_reason": anthropic_resp.get("stop_reason", "end_turn"), "stop_sequence": None},
+        "usage": {"output_tokens": anthropic_resp.get("usage", {}).get("output_tokens", 0)},
+    })
+    yield sse_event("message_stop", {})
+
+    usage = anthropic_resp.get("usage", {})
+    log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
+        req_id=req_id)
+
+
 async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncIterator[str]:
     """Wrap an SSE generator to log each outgoing Anthropic event."""
     async for event_str in gen:
         debug_sse("out", event_str, req_id=req_id)
         yield event_str
+
+
+# ---------------------------------------------------------------------------
+# Proxy-handled tools (WebFetch, WebSearch, web_search)
+# ---------------------------------------------------------------------------
+
+PROXY_HANDLED_TOOLS = {"WebFetch", "WebSearch", "web_search"}
+
+
+_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+
+async def execute_proxy_tool(name: str, tool_input: dict, req_id: str = "") -> str:
+    """Execute a proxy-handled tool and return result text."""
+    if name == "WebFetch":
+        url = tool_input.get("url", "")
+        log(f"web_fetch {url}", req_id=req_id)
+        resp = await http_client.get(url, headers=_FETCH_HEADERS, timeout=15, follow_redirects=True)
+        result = resp.text
+        debug_log("TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        return result
+
+    if name in ("WebSearch", "web_search"):
+        query = tool_input.get("query", "")
+        log(f"web_search {query}", req_id=req_id)
+        resp = await http_client.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=_FETCH_HEADERS,
+            timeout=15,
+            follow_redirects=True,
+        )
+        result = resp.text
+        debug_log("TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        return result
+
+    return f"Unknown tool: {name}"
+
+
+def _extract_proxy_tool_calls(openai_resp: dict) -> list:
+    """Extract tool_calls that belong to PROXY_HANDLED_TOOLS from an OpenAI response."""
+    choices = openai_resp.get("choices", [])
+    if not choices:
+        return []
+    msg = choices[0].get("message", {})
+    tool_calls = msg.get("tool_calls") or []
+    return [tc for tc in tool_calls if tc.get("function", {}).get("name") in PROXY_HANDLED_TOOLS]
+
+
+def _has_only_proxy_tools(openai_resp: dict) -> bool:
+    """Check if ALL tool_calls in the response are proxy-handled."""
+    choices = openai_resp.get("choices", [])
+    if not choices:
+        return False
+    msg = choices[0].get("message", {})
+    tool_calls = msg.get("tool_calls") or []
+    if not tool_calls:
+        return False
+    return all(tc.get("function", {}).get("name") in PROXY_HANDLED_TOOLS for tc in tool_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -945,29 +1063,63 @@ async def create_message(request: Request):
     except Exception as e:
         return error_response(400, "invalid_request_error", f"Request conversion error: {e}")
 
-    debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
-              model=openai_body.get("model", ""),
-              base_url=ep["base_url"],
-              messages=len(openai_body.get("messages", [])))
+    # All requests go through sync first to allow tool interception.
+    # If client wants stream, we fake-stream the final response.
+    openai_body["stream"] = False
+    openai_body.pop("stream_options", None)
 
     try:
-        if is_stream:
-            openai_resp = await call_openai(openai_body, stream=True,
+        for _tool_iter in range(6):  # max 5 tool round-trips + 1 final
+            debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
+                      model=openai_body.get("model", ""),
+                      base_url=ep["base_url"],
+                      messages=len(openai_body.get("messages", [])))
+
+            openai_resp = await call_openai(openai_body, stream=False,
                                             base_url=ep["base_url"], api_key=ep["api_key"])
+            debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
+                      finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
+
+            proxy_tools = _extract_proxy_tool_calls(openai_resp)
+            if not proxy_tools:
+                break
+
+            # Model called proxy-handled tools — execute them and resend
+            assistant_msg = openai_resp["choices"][0]["message"]
+            openai_body["messages"].append(assistant_msg)
+
+            for tc in proxy_tools:
+                fn = tc["function"]
+                tool_name = fn["name"]
+                try:
+                    tool_input = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    tool_input = {}
+                try:
+                    result = await execute_proxy_tool(tool_name, tool_input, req_id=req_id)
+                except Exception as e:
+                    result = f"Error: {e}"
+                    log(f"tool error {tool_name}: {e}", req_id=req_id)
+                openai_body["messages"].append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+        anthropic_resp = convert_response(openai_resp, anthropic_model)
+
+        if is_stream:
+            debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+                      stop=anthropic_resp.get("stop_reason"))
             return StreamingResponse(
                 _debug_stream_wrap(
-                    stream_translate(openai_resp, anthropic_model, req_id=req_id),
+                    fake_stream_from_response(anthropic_resp, req_id=req_id),
                     req_id,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         else:
-            openai_resp = await call_openai(openai_body, stream=False,
-                                            base_url=ep["base_url"], api_key=ep["api_key"])
-            debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
-                      finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
-            anthropic_resp = convert_response(openai_resp, anthropic_model)
             usage = anthropic_resp.get("usage", {})
             log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
                 req_id=req_id)
