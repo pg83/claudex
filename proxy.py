@@ -6,13 +6,14 @@ responses in Anthropic format. Designed for use with Claude Code via
 ANTHROPIC_BASE_URL.
 
 Usage:
-    python proxy.py --port 8082 --openai-api-key sk-...
+    python proxy.py serve config.json [--debug] [--port PORT]
     ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY=dummy claude
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -28,44 +29,101 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Configuration
 # ---------------------------------------------------------------------------
 
-def env_bool(key: str) -> bool:
-    return os.environ.get(key, "").lower() in ("1", "true", "yes")
-
-
 CONFIG = {
-    "openai_api_key": "",
-    "openai_base_url": "https://api.openai.com/v1",
-    "default_model": "gpt-5.4",
     "debug": False,
-    "compress_model": "",       # empty = disabled
-    "compress_keep": 4,         # recent messages to keep verbatim
-    "compress_min": 8,          # min messages before compression kicks in
+    "compress_keep": 4,
+    "compress_min": 8,
 }
 
-MODEL_MAP: dict = {
-    # Will be populated at startup; any unknown model -> default_model
-}
+# Endpoint table: role -> {base_url, model, api_key}
+# Roles: "opus", "sonnet", "haiku", "compress"
+ENDPOINTS: dict = {}
 
-# Short aliases -> list of full Anthropic model IDs in that family
-MODEL_ALIASES: dict = {
-    "opus": [
-        "claude-opus-4-6",
-        "claude-opus-4-6-20250610",
-    ],
-    "sonnet": [
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5-20250514",
-        "claude-sonnet-4-20250514",
-        "claude-3-5-sonnet-20241022",
-    ],
-    "haiku": [
-        "claude-haiku-4-5",
-        "claude-haiku-4-5-20241022",
-        "claude-3-5-haiku-20241022",
-    ],
+# Fixed fallback chain: if role not configured, try next
+FALLBACK_CHAIN = {
+    "compress": "haiku",
+    "haiku": "sonnet",
+    "sonnet": "opus",
 }
 
 http_client: httpx.AsyncClient = None  # type: ignore[assignment]
+
+
+def _expand_env(s: str) -> str:
+    """Expand $ENV_VAR references in a string."""
+    if not isinstance(s, str):
+        return s
+    return re.sub(r'\$([A-Za-z_][A-Za-z0-9_]*)', lambda m: os.environ.get(m.group(1), m.group(0)), s)
+
+
+def load_config(path: str):
+    """Load JSON config file and populate ENDPOINTS, FALLBACKS, CONFIG."""
+    with open(path) as f:
+        cfg = json.load(f)
+
+    # Shared defaults
+    shared_api_key = _expand_env(cfg.get("api_key", ""))
+
+    # Listen address
+    listen = cfg.get("listen", "127.0.0.1:8082")
+    if ":" in listen:
+        host, port = listen.rsplit(":", 1)
+        CONFIG["host"] = host
+        CONFIG["port"] = int(port)
+    else:
+        CONFIG["host"] = "127.0.0.1"
+        CONFIG["port"] = int(listen)
+
+    # Compression settings
+    CONFIG["compress_keep"] = cfg.get("compress_keep", 4)
+    CONFIG["compress_min"] = cfg.get("compress_min", 8)
+    CONFIG["debug"] = cfg.get("debug", False)
+
+    # Endpoints
+    for role, ep in cfg.get("endpoints", {}).items():
+        ENDPOINTS[role] = {
+            "base_url": _expand_env(ep.get("base_url", "")),
+            "model": _expand_env(ep.get("model", "")),
+            "api_key": _expand_env(ep.get("api_key", shared_api_key)),
+            "ssl_verify": ep.get("ssl_verify", False),
+        }
+
+
+
+def resolve_endpoint(name: str) -> dict:
+    """Resolve a role name or Anthropic model name to an endpoint dict.
+
+    Fallback chain (hardcoded): compress -> haiku -> sonnet -> opus.
+    """
+    # Direct role lookup
+    if name in ENDPOINTS:
+        return ENDPOINTS[name]
+
+    # Pattern match Anthropic model name -> role
+    role = None
+    name_lower = name.lower()
+    if "opus" in name_lower:
+        role = "opus"
+    elif "haiku" in name_lower:
+        role = "haiku"
+    elif "sonnet" in name_lower:
+        role = "sonnet"
+
+    # Walk fallback chain: compress -> haiku -> sonnet -> opus
+    current = role
+    visited = set()
+    while current:
+        if current in ENDPOINTS:
+            return ENDPOINTS[current]
+        if current in visited:
+            break
+        visited.add(current)
+        current = FALLBACK_CHAIN.get(current)
+
+    # Last resort: first defined endpoint
+    if ENDPOINTS:
+        return next(iter(ENDPOINTS.values()))
+    return {"base_url": "", "model": name, "api_key": "", "ssl_verify": False}
 
 
 @asynccontextmanager
@@ -73,7 +131,7 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(300.0, connect=10.0),
-        verify=not CONFIG.get("no_ssl_verify", False),
+        verify=False,
     )
     yield
     await http_client.aclose()
@@ -111,6 +169,11 @@ def _strip_chat_suffix(url: str) -> str:
         if base.endswith(suffix):
             return base[: -len(suffix)].rstrip("/")
     return base
+
+
+def _chat_url(base_url: str) -> str:
+    """Get the chat completions URL from a base URL."""
+    return _strip_chat_suffix(base_url) + "/chat/completions"
 
 
 def extract_system_text(system) -> str:
@@ -214,10 +277,7 @@ def debug_sse(direction: str, event_str: str, req_id: str = ""):
 
 
 def convert_content_to_openai(content):
-    """Convert Anthropic content (string or block array) to OpenAI format.
-
-    Filters out tool_result and thinking blocks — those are handled separately.
-    """
+    """Convert Anthropic content (string or block array) to OpenAI format."""
     if isinstance(content, str):
         return content
 
@@ -233,7 +293,6 @@ def convert_content_to_openai(content):
                 parts.append({"type": "image_url", "image_url": {"url": url}})
             elif source.get("type") == "url":
                 parts.append({"type": "image_url", "image_url": {"url": source["url"]}})
-        # tool_result and thinking blocks are skipped here
 
     if not parts:
         return ""
@@ -284,39 +343,29 @@ def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     return _TOOL_CHOICE_MAP.get(tc_type, "auto")
 
 
-def convert_request(body: dict) -> dict:
+def convert_request(body: dict, openai_model: str) -> dict:
     """Translate an Anthropic Messages API request to OpenAI Chat Completions."""
-    # Model mapping
-    anthropic_model = body.get("model", "")
-    openai_model = MODEL_MAP.get(anthropic_model, CONFIG["default_model"])
-
-    # Thinking config
     thinking = body.get("thinking")
     has_thinking = thinking and thinking.get("type") in ("enabled", "adaptive")
 
-    # Build OpenAI messages
     openai_messages: list[dict] = []
 
-    # System prompt -> developer role message
     system_text = extract_system_text(body.get("system"))
     if system_text:
         openai_messages.append({"role": "developer", "content": system_text})
 
-    # Convert messages
     for msg in body.get("messages", []):
         role = msg["role"]
         content = msg.get("content", "")
 
         if role == "user":
-            # Split tool_result blocks from the rest
             if isinstance(content, list):
                 tool_results = [b for b in content if b.get("type") == "tool_result"]
                 other_blocks = [b for b in content if b.get("type") != "tool_result"]
             else:
                 tool_results = []
-                other_blocks = content  # string
+                other_blocks = content
 
-            # Emit tool messages first (they must follow the assistant's tool_calls)
             for tr in tool_results:
                 openai_messages.append({
                     "role": "tool",
@@ -324,7 +373,6 @@ def convert_request(body: dict) -> dict:
                     "content": extract_tool_result_content(tr),
                 })
 
-            # Emit remaining user content
             if other_blocks:
                 converted = convert_content_to_openai(other_blocks)
                 if converted:
@@ -334,7 +382,6 @@ def convert_request(body: dict) -> dict:
             if isinstance(content, str):
                 openai_messages.append({"role": "assistant", "content": content})
             elif isinstance(content, list):
-                # Extract text, tool_use; drop thinking
                 text_parts = []
                 tool_calls = []
                 for block in content:
@@ -350,7 +397,6 @@ def convert_request(body: dict) -> dict:
                                 "arguments": json.dumps(block.get("input", {})),
                             },
                         })
-                    # thinking blocks dropped
 
                 assistant_msg: dict = {"role": "assistant"}
                 text = "\n".join(text_parts) if text_parts else None
@@ -361,41 +407,33 @@ def convert_request(body: dict) -> dict:
             else:
                 openai_messages.append({"role": "assistant", "content": str(content)})
 
-    # Build OpenAI request body
     openai_body: dict = {
         "model": openai_model,
         "messages": openai_messages,
         "stream": body.get("stream", False),
     }
 
-    # max_tokens
     max_tokens = body.get("max_tokens", 4096)
     if has_thinking:
         openai_body["max_completion_tokens"] = max_tokens
     else:
         openai_body["max_tokens"] = max_tokens
 
-    # Temperature (not allowed with reasoning models)
     if "temperature" in body and not has_thinking:
         openai_body["temperature"] = body["temperature"]
 
-    # top_p
     if "top_p" in body:
         openai_body["top_p"] = body["top_p"]
 
-    # Stop sequences
     if "stop_sequences" in body:
         openai_body["stop"] = body["stop_sequences"]
 
-    # Tools
     if "tools" in body and body["tools"]:
         openai_body["tools"] = convert_tools(body["tools"])
 
-    # Tool choice
     if "tool_choice" in body:
         openai_body["tool_choice"] = convert_tool_choice(body["tool_choice"])
 
-    # Thinking -> reasoning_effort
     if has_thinking:
         budget = thinking.get("budget_tokens", 0)
         if budget <= 2048:
@@ -405,7 +443,6 @@ def convert_request(body: dict) -> dict:
         else:
             openai_body["reasoning_effort"] = "high"
 
-    # Stream options for usage
     if body.get("stream"):
         openai_body["stream_options"] = {"include_usage": True}
 
@@ -431,7 +468,6 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
 
     content_blocks: list[dict] = []
 
-    # Reasoning / thinking
     if msg.get("reasoning_content"):
         content_blocks.append({
             "type": "thinking",
@@ -439,11 +475,9 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
             "signature": "",
         })
 
-    # Text
     if msg.get("content"):
         content_blocks.append({"type": "text", "text": msg["content"]})
 
-    # Tool calls
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
             try:
@@ -592,7 +626,6 @@ async def stream_translate(
     """Translate OpenAI SSE stream to Anthropic SSE events."""
     state = StreamState(anthropic_model)
 
-    # message_start
     yield sse_event("message_start", {
         "message": {
             "id": state.message_id,
@@ -628,7 +661,6 @@ async def stream_translate(
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
 
-                # --- Reasoning content ---
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
                     for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
@@ -638,7 +670,6 @@ async def stream_translate(
                         "delta": {"type": "thinking_delta", "thinking": reasoning},
                     })
 
-                # --- Text content ---
                 text = delta.get("content")
                 if text:
                     for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
@@ -648,14 +679,12 @@ async def stream_translate(
                         "delta": {"type": "text_delta", "text": text},
                     })
 
-                # --- Tool calls ---
                 tc_deltas = delta.get("tool_calls")
                 if tc_deltas:
                     for tc_delta in tc_deltas:
                         tc_idx = tc_delta.get("index", 0)
 
                         if tc_idx != state.current_tool_index:
-                            # Each tool call is a separate block — force close previous
                             for ev in close_block_events(state):
                                 yield ev
                             tool_id = to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
@@ -669,7 +698,6 @@ async def stream_translate(
                                 },
                             })
 
-                        # Stream arguments as input_json_delta
                         args_chunk = tc_delta.get("function", {}).get("arguments", "")
                         if args_chunk:
                             yield sse_event("content_block_delta", {
@@ -677,7 +705,6 @@ async def stream_translate(
                                 "delta": {"type": "input_json_delta", "partial_json": args_chunk},
                             })
 
-            # Usage chunk (empty choices, has usage)
             usage = chunk.get("usage")
             if usage:
                 state.input_tokens = usage.get("prompt_tokens", state.input_tokens)
@@ -685,11 +712,9 @@ async def stream_translate(
     finally:
         await openai_response.aclose()
 
-    # Close any open block
     for ev in close_block_events(state):
         yield ev
 
-    # message_delta with stop reason
     stop_reason = FINISH_REASON_MAP.get(finish_reason, "end_turn")
     yield sse_event("message_delta", {
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -711,12 +736,12 @@ async def stream_translate(
 # ---------------------------------------------------------------------------
 
 
-async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, dict]:
+async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: str) -> Union[httpx.Response, dict]:
     headers = {
-        "Authorization": f"Bearer {CONFIG['openai_api_key']}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    url = _strip_chat_suffix(CONFIG['openai_base_url']) + "/chat/completions"
+    url = _chat_url(base_url)
 
     if stream:
         req = http_client.build_request("POST", url, json=openai_body, headers=headers)
@@ -734,7 +759,6 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
         resp = await http_client.post(url, json=openai_body, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-        # Unwrap provider wrappers (e.g. Yandex Eliza: {"response": {...actual...}})
         if "response" in data and "choices" not in data:
             data = data["response"]
         return data
@@ -761,36 +785,23 @@ COMPRESS_PROMPT = (
 
 
 def _has_block_type(content, btype: str) -> bool:
-    """Check if a message content (str or list) contains blocks of the given type."""
     if not isinstance(content, list):
         return False
     return any(b.get("type") == btype for b in content)
 
 
 def find_safe_split(messages: list, keep: int) -> int:
-    """Find the split point that doesn't break tool_use -> tool_result chains.
-
-    Returns index i such that messages[:i] can be compressed and
-    messages[i:] stay verbatim. The last `keep` messages are always kept.
-
-    Strategy: start at len-keep, then walk BACKWARD to find a clean boundary.
-    A clean boundary is a position where the message AT that index is NOT
-    a tool_result (i.e. we don't start the kept tail mid-chain).
-    """
+    """Find split point that doesn't break tool_use -> tool_result chains."""
     boundary = len(messages) - keep
     if boundary < 2:
         return 0
-    # Walk backward from boundary: find a position where messages[i]
-    # is not a tool_result continuation
     for i in range(boundary, 1, -1):
-        msg = messages[i]  # first message in the kept tail
+        msg = messages[i]
         content = msg.get("content", "")
-        # If this message is a tool_result, the tool_use before it
-        # would be orphaned — keep walking back
         if msg["role"] == "user" and _has_block_type(content, "tool_result"):
             continue
         return i
-    return 0  # can't find a safe split, don't compress
+    return 0
 
 
 def _truncate(s: str, limit: int = 500) -> str:
@@ -833,11 +844,12 @@ def serialize_messages(messages: list) -> str:
 
 
 async def call_compress_llm(messages: list) -> str:
-    """Send messages to the cheap compression model and return summary text."""
+    """Send messages to the compression model and return summary text."""
+    ep = resolve_endpoint("compress")
     serialized = serialize_messages(messages)
 
     compress_body = {
-        "model": CONFIG["compress_model"],
+        "model": ep["model"],
         "messages": [
             {"role": "developer", "content": COMPRESS_PROMPT},
             {"role": "user", "content": f"<conversation>\n{serialized}\n</conversation>"},
@@ -847,12 +859,11 @@ async def call_compress_llm(messages: list) -> str:
         "stream": False,
     }
 
-    # Use the same HTTP client / auth / URL as regular requests
     headers = {
-        "Authorization": f"Bearer {CONFIG['openai_api_key']}",
+        "Authorization": f"Bearer {ep['api_key']}",
         "Content-Type": "application/json",
     }
-    url = _strip_chat_suffix(CONFIG["openai_base_url"]) + "/chat/completions"
+    url = _chat_url(ep["base_url"])
 
     resp = await http_client.post(url, json=compress_body, headers=headers)
     resp.raise_for_status()
@@ -880,11 +891,12 @@ async def compress_context(messages: list, req_id: str = "") -> list:
 
     original_chars = sum(len(json.dumps(m.get("content", ""))) for m in messages)
 
+    ep = resolve_endpoint("compress")
     try:
         summary = await call_compress_llm(to_compress)
     except Exception as e:
         debug_log("COMPRESS ERROR", {"error": str(e)}, req_id=req_id)
-        return messages  # fallback: no compression
+        return messages
 
     compressed = [
         {"role": "user", "content": f"<context-summary>\n{summary}\n</context-summary>"},
@@ -898,7 +910,7 @@ async def compress_context(messages: list, req_id: str = "") -> list:
               kept_verbatim=len(tail),
               original_chars=original_chars,
               summary_chars=len(summary),
-              model=CONFIG["compress_model"])
+              model=ep["model"])
 
     return compressed
 
@@ -919,28 +931,32 @@ async def create_message(request: Request):
 
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
+    ep = resolve_endpoint(anthropic_model)
 
     debug_log("ANTHROPIC REQUEST", body, req_id=req_id,
               model=anthropic_model, stream=is_stream,
+              endpoint_model=ep["model"],
               messages=len(body.get("messages", [])),
               tools=len(body.get("tools", [])))
 
     # Context compression
-    if CONFIG["compress_model"] and "messages" in body:
+    if "compress" in ENDPOINTS and "messages" in body:
         body["messages"] = await compress_context(body["messages"], req_id=req_id)
 
     try:
-        openai_body = convert_request(body)
+        openai_body = convert_request(body, ep["model"])
     except Exception as e:
         return error_response(400, "invalid_request_error", f"Request conversion error: {e}")
 
     debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
               model=openai_body.get("model", ""),
+              base_url=ep["base_url"],
               messages=len(openai_body.get("messages", [])))
 
     try:
         if is_stream:
-            openai_resp = await call_openai(openai_body, stream=True)
+            openai_resp = await call_openai(openai_body, stream=True,
+                                            base_url=ep["base_url"], api_key=ep["api_key"])
             return StreamingResponse(
                 _debug_stream_wrap(
                     stream_translate(openai_resp, anthropic_model, req_id=req_id),
@@ -950,7 +966,8 @@ async def create_message(request: Request):
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         else:
-            openai_resp = await call_openai(openai_body, stream=False)
+            openai_resp = await call_openai(openai_body, stream=False,
+                                            base_url=ep["base_url"], api_key=ep["api_key"])
             debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
                       finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
             anthropic_resp = convert_response(openai_resp, anthropic_model)
@@ -978,11 +995,8 @@ async def count_tokens(request: Request):
         return JSONResponse(content={"input_tokens": 0})
 
     total_chars = 0
-
-    # System prompt
     total_chars += len(extract_system_text(body.get("system")))
 
-    # Messages
     for msg in body.get("messages", []):
         content = msg.get("content", "")
         if isinstance(content, str):
@@ -1002,30 +1016,20 @@ async def count_tokens(request: Request):
                 elif btype == "tool_use":
                     total_chars += len(json.dumps(block.get("input", {})))
 
-    # Tool definitions
     if "tools" in body:
         total_chars += len(json.dumps(body["tools"]))
 
-    estimated_tokens = max(1, total_chars // 4)
-
-    return JSONResponse(content={"input_tokens": estimated_tokens})
+    return JSONResponse(content={"input_tokens": max(1, total_chars // 4)})
 
 
 @app.get("/v1/models")
 async def list_models():
-    models = list(MODEL_MAP.keys()) or [
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
+    models = [f"claude-{role}" for role in ENDPOINTS if role != "compress"] or [
+        "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
     ]
     return JSONResponse(content={
         "data": [
-            {
-                "id": m,
-                "type": "model",
-                "display_name": m,
-                "created_at": "2025-01-01T00:00:00Z",
-            }
+            {"id": m, "type": "model", "display_name": m, "created_at": "2025-01-01T00:00:00Z"}
             for m in models
         ],
         "has_more": False,
@@ -1037,59 +1041,62 @@ async def list_models():
 # ---------------------------------------------------------------------------
 
 
-def _add_common_args(parser: argparse.ArgumentParser):
-    """Add args shared between subcommands."""
-    parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
-    parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-    parser.add_argument(
-        "--no-ssl-verify",
-        action="store_true",
-        default=env_bool("NO_SSL_VERIFY"),
-        help="Disable SSL certificate verification for upstream",
-    )
+def cmd_serve(args: argparse.Namespace):
+    """Start the proxy server."""
+    load_config(args.config)
+    if args.debug:
+        CONFIG["debug"] = True
+    if args.port:
+        CONFIG["port"] = args.port
 
+    host = CONFIG.get("host", "127.0.0.1")
+    port = CONFIG.get("port", 8082)
 
-def _get_models_url(base_url: str) -> str:
-    """Derive /models endpoint from the configured base URL."""
-    return _strip_chat_suffix(base_url) + "/models"
+    print(f"Proxy starting on {host}:{port}")
+    print("Endpoints:")
+    for role, ep in ENDPOINTS.items():
+        print(f"  {role}: {ep['base_url']} -> {ep['model']}")
+    if "compress" in ENDPOINTS:
+        print(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
+    if CONFIG["debug"]:
+        print("Debug: ENABLED (JSONL to stderr)")
+    print()
+    print("Usage:")
+    print(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def cmd_models(args: argparse.Namespace):
-    """List models available at the upstream OpenAI-compatible endpoint."""
-    if not args.openai_api_key:
-        sys.exit("Error: --openai-api-key or OPENAI_API_KEY is required")
+    """List models available at the first endpoint."""
+    load_config(args.config)
+    if not ENDPOINTS:
+        sys.exit("No endpoints configured")
 
-    url = _get_models_url(args.openai_base_url)
-    headers = {"Authorization": f"Bearer {args.openai_api_key}"}
-    verify = not args.no_ssl_verify
+    ep = next(iter(ENDPOINTS.values()))
+    url = _strip_chat_suffix(ep["base_url"]) + "/models"
+    headers = {"Authorization": f"Bearer {ep['api_key']}"}
 
     print(f"Fetching models from {url} ...\n")
     try:
-        with httpx.Client(verify=verify, timeout=30.0) as client:
+        with httpx.Client(verify=False, timeout=30.0) as client:
             resp = client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as e:
-        try:
-            body = e.response.text
-        except Exception:
-            body = str(e)
-        sys.exit(f"HTTP {e.response.status_code}: {body}")
+        sys.exit(f"HTTP {e.response.status_code}: {e.response.text}")
     except Exception as e:
         sys.exit(f"Error: {e}")
 
-    # Handle provider wrappers (e.g. Yandex Eliza)
     if "response" in data and "data" not in data:
         data = data["response"]
 
     models = data.get("data", [])
     if not models:
-        print("No models returned (or endpoint does not support GET /models).")
+        print("No models returned.")
         return
 
-    # Sort by id
     models.sort(key=lambda m: m.get("id", ""))
-
     print(f"Found {len(models)} models:\n")
     for m in models:
         mid = m.get("id", "?")
@@ -1098,109 +1105,17 @@ def cmd_models(args: argparse.Namespace):
         print(f"  {mid}{extra}")
 
 
-def cmd_serve(args: argparse.Namespace):
-    """Start the proxy server."""
-    if not args.openai_api_key:
-        sys.exit("Error: --openai-api-key or OPENAI_API_KEY is required")
-
-    CONFIG["openai_api_key"] = args.openai_api_key
-    CONFIG["openai_base_url"] = args.openai_base_url
-    CONFIG["default_model"] = args.default_model
-    CONFIG["debug"] = args.debug
-    CONFIG["no_ssl_verify"] = args.no_ssl_verify
-    CONFIG["compress_model"] = args.compress_model
-    CONFIG["compress_keep"] = args.compress_keep
-    CONFIG["compress_min"] = args.compress_min
-
-    # Build model map: start with all known models -> default
-    default = args.default_model
-    for alias, models in MODEL_ALIASES.items():
-        for m in models:
-            MODEL_MAP[m] = default
-
-    # Apply custom mappings (CLI + env var)
-    # Supports both full model IDs and short aliases (opus, sonnet, haiku)
-    map_pairs = list(args.model_map or [])
-    env_map = os.environ.get("MODEL_MAP", "")
-    if env_map:
-        map_pairs.extend(env_map.split(","))
-    for pair in map_pairs:
-        if "=" not in pair:
-            continue
-        k, v = pair.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k in MODEL_ALIASES:
-            for m in MODEL_ALIASES[k]:
-                MODEL_MAP[m] = v
-        else:
-            MODEL_MAP[k] = v
-
-    print(f"Proxy starting on {args.host}:{args.port}")
-    print(f"OpenAI base URL: {args.openai_base_url}")
-    print(f"Default model: {args.default_model}")
-    by_target: dict = {}
-    for src, dst in MODEL_MAP.items():
-        by_target.setdefault(dst, []).append(src)
-    print("Model map:")
-    for target, sources in by_target.items():
-        print(f"  {target} <- {', '.join(sources)}")
-    if CONFIG["compress_model"]:
-        print(f"Context compression: {CONFIG['compress_model']} (keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']})")
-    if CONFIG["debug"]:
-        print("Debug logging: ENABLED (stderr)")
-    print()
-    print("Usage:")
-    print(f"  ANTHROPIC_BASE_URL=http://{args.host}:{args.port} ANTHROPIC_API_KEY=dummy claude")
-
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Anthropic -> OpenAI proxy")
     sub = parser.add_subparsers(dest="command")
 
-    # --- serve ---
     p_serve = sub.add_parser("serve", help="Start the proxy server")
-    _add_common_args(p_serve)
-    p_serve.add_argument("--port", type=int, default=int(os.environ.get("PROXY_PORT", "8082")))
-    p_serve.add_argument("--host", default=os.environ.get("PROXY_HOST", "127.0.0.1"))
-    p_serve.add_argument("--default-model", default=os.environ.get("DEFAULT_MODEL", "gpt-5.4"))
-    p_serve.add_argument(
-        "--model-map",
-        nargs="*",
-        metavar="CLAUDE=OPENAI",
-        help=(
-            "Model mapping pairs. Supports short aliases (opus, sonnet, haiku) "
-            "or full model IDs. Examples: haiku=openai/gpt-5.4-nano "
-            "opus=openai/gpt-5.4 claude-sonnet-4-6=openai/gpt-5.4-mini. "
-            "Also reads MODEL_MAP env var (comma-separated)."
-        ),
-    )
-    p_serve.add_argument(
-        "--debug",
-        action="store_true",
-        default=env_bool("DEBUG"),
-        help="Enable debug logging of all requests/responses to stderr",
-    )
-    p_serve.add_argument(
-        "--compress-model",
-        default=os.environ.get("COMPRESS_MODEL", ""),
-        help="Model for context compression (enables compression). E.g. google/gemini-2.5-flash-lite",
-    )
-    p_serve.add_argument(
-        "--compress-keep", type=int,
-        default=int(os.environ.get("COMPRESS_KEEP", "4")),
-        help="Recent messages to keep verbatim (default: 4)",
-    )
-    p_serve.add_argument(
-        "--compress-min", type=int,
-        default=int(os.environ.get("COMPRESS_MIN", "8")),
-        help="Min messages before compression kicks in (default: 8)",
-    )
+    p_serve.add_argument("config", help="Path to config.json")
+    p_serve.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p_serve.add_argument("--port", type=int, default=0, help="Override listen port")
 
-    # --- models ---
-    p_models = sub.add_parser("models", help="List models available at upstream endpoint")
-    _add_common_args(p_models)
+    p_models = sub.add_parser("models", help="List models at first configured endpoint")
+    p_models.add_argument("config", help="Path to config.json")
 
     args = parser.parse_args()
 
