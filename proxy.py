@@ -40,6 +40,25 @@ MODEL_MAP: dict = {
     # Will be populated at startup; any unknown model -> default_model
 }
 
+# Short aliases -> list of full Anthropic model IDs in that family
+MODEL_ALIASES: dict = {
+    "opus": [
+        "claude-opus-4-6",
+        "claude-opus-4-6-20250610",
+    ],
+    "sonnet": [
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5-20250514",
+        "claude-sonnet-4-20250514",
+        "claude-3-5-sonnet-20241022",
+    ],
+    "haiku": [
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20241022",
+        "claude-3-5-haiku-20241022",
+    ],
+}
+
 http_client: httpx.AsyncClient = None  # type: ignore[assignment]
 
 
@@ -889,7 +908,12 @@ def main():
         "--model-map",
         nargs="*",
         metavar="CLAUDE=OPENAI",
-        help="Model mapping pairs, e.g. claude-sonnet-4-6=gpt-5.4",
+        help=(
+            "Model mapping pairs. Supports short aliases (opus, sonnet, haiku) "
+            "or full model IDs. Examples: haiku=openai/gpt-5.4-nano "
+            "opus=openai/gpt-5.4 claude-sonnet-4-6=openai/gpt-5.4-mini. "
+            "Also reads MODEL_MAP env var (comma-separated)."
+        ),
     )
     parser.add_argument(
         "--no-ssl-verify",
@@ -914,31 +938,40 @@ def main():
     CONFIG["debug"] = args.debug
     CONFIG["no_ssl_verify"] = args.no_ssl_verify
 
-    # Default model map
+    # Build model map: start with all known models -> default
     default = args.default_model
-    MODEL_MAP.update({
-        "claude-opus-4-6": default,
-        "claude-sonnet-4-6": default,
-        "claude-sonnet-4-5-20250514": default,
-        "claude-sonnet-4-20250514": default,
-        "claude-3-5-sonnet-20241022": default,
-        "claude-3-5-haiku-20241022": default,
-        "claude-haiku-4-5": default,
-        # Full-qualified OpenRouter names
-        "claude-haiku-4-5-20241022": default,
-    })
+    for alias, models in MODEL_ALIASES.items():
+        for m in models:
+            MODEL_MAP[m] = default
 
-    # Custom model mappings from CLI
-    if args.model_map:
-        for pair in args.model_map:
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                MODEL_MAP[k.strip()] = v.strip()
+    # Apply custom mappings (CLI + env var)
+    # Supports both full model IDs and short aliases (opus, sonnet, haiku)
+    map_pairs = list(args.model_map or [])
+    env_map = os.environ.get("MODEL_MAP", "")
+    if env_map:
+        map_pairs.extend(env_map.split(","))
+    for pair in map_pairs:
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k in MODEL_ALIASES:
+            # Short alias -> expand to all models in family
+            for m in MODEL_ALIASES[k]:
+                MODEL_MAP[m] = v
+        else:
+            MODEL_MAP[k] = v
 
     print(f"Proxy starting on {args.host}:{args.port}")
     print(f"OpenAI base URL: {args.openai_base_url}")
     print(f"Default model: {args.default_model}")
-    print(f"Model map: {MODEL_MAP}")
+    # Print model map grouped by target
+    by_target: dict = {}
+    for src, dst in MODEL_MAP.items():
+        by_target.setdefault(dst, []).append(src)
+    print("Model map:")
+    for target, sources in by_target.items():
+        print(f"  {target} <- {', '.join(sources)}")
     if CONFIG["debug"]:
         print("Debug logging: ENABLED (stderr)")
     print()
