@@ -897,40 +897,77 @@ async def list_models():
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Anthropic -> OpenAI proxy")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PROXY_PORT", "8082")))
-    parser.add_argument("--host", default=os.environ.get("PROXY_HOST", "127.0.0.1"))
+def _add_common_args(parser: argparse.ArgumentParser):
+    """Add args shared between subcommands."""
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
     parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-    parser.add_argument("--default-model", default=os.environ.get("DEFAULT_MODEL", "gpt-5.4"))
-    parser.add_argument(
-        "--model-map",
-        nargs="*",
-        metavar="CLAUDE=OPENAI",
-        help=(
-            "Model mapping pairs. Supports short aliases (opus, sonnet, haiku) "
-            "or full model IDs. Examples: haiku=openai/gpt-5.4-nano "
-            "opus=openai/gpt-5.4 claude-sonnet-4-6=openai/gpt-5.4-mini. "
-            "Also reads MODEL_MAP env var (comma-separated)."
-        ),
-    )
     parser.add_argument(
         "--no-ssl-verify",
         action="store_true",
         default=os.environ.get("NO_SSL_VERIFY", "").lower() in ("1", "true", "yes"),
         help="Disable SSL certificate verification for upstream",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
-        help="Enable debug logging of all requests/responses to stderr",
-    )
-    args = parser.parse_args()
 
+
+def _get_models_url(base_url: str) -> str:
+    """Derive /models endpoint from the configured base URL."""
+    base = base_url.rstrip("/")
+    # Strip /chat/completions(s) suffix to get the API root
+    for suffix in ("/chat/completions", "/chat/completion"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    return f"{base}/models"
+
+
+def cmd_models(args: argparse.Namespace):
+    """List models available at the upstream OpenAI-compatible endpoint."""
     if not args.openai_api_key:
-        parser.error("--openai-api-key or OPENAI_API_KEY is required")
+        sys.exit("Error: --openai-api-key or OPENAI_API_KEY is required")
+
+    url = _get_models_url(args.openai_base_url)
+    headers = {"Authorization": f"Bearer {args.openai_api_key}"}
+    verify = not args.no_ssl_verify
+
+    print(f"Fetching models from {url} ...\n")
+    try:
+        with httpx.Client(verify=verify, timeout=30.0) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        try:
+            body = e.response.text
+        except Exception:
+            body = str(e)
+        sys.exit(f"HTTP {e.response.status_code}: {body}")
+    except Exception as e:
+        sys.exit(f"Error: {e}")
+
+    # Handle provider wrappers (e.g. Yandex Eliza)
+    if "response" in data and "data" not in data:
+        data = data["response"]
+
+    models = data.get("data", [])
+    if not models:
+        print("No models returned (or endpoint does not support GET /models).")
+        return
+
+    # Sort by id
+    models.sort(key=lambda m: m.get("id", ""))
+
+    print(f"Found {len(models)} models:\n")
+    for m in models:
+        mid = m.get("id", "?")
+        owned_by = m.get("owned_by", "")
+        extra = f"  (by {owned_by})" if owned_by else ""
+        print(f"  {mid}{extra}")
+
+
+def cmd_serve(args: argparse.Namespace):
+    """Start the proxy server."""
+    if not args.openai_api_key:
+        sys.exit("Error: --openai-api-key or OPENAI_API_KEY is required")
 
     CONFIG["openai_api_key"] = args.openai_api_key
     CONFIG["openai_base_url"] = args.openai_base_url
@@ -956,7 +993,6 @@ def main():
         k, v = pair.split("=", 1)
         k, v = k.strip(), v.strip()
         if k in MODEL_ALIASES:
-            # Short alias -> expand to all models in family
             for m in MODEL_ALIASES[k]:
                 MODEL_MAP[m] = v
         else:
@@ -965,7 +1001,6 @@ def main():
     print(f"Proxy starting on {args.host}:{args.port}")
     print(f"OpenAI base URL: {args.openai_base_url}")
     print(f"Default model: {args.default_model}")
-    # Print model map grouped by target
     by_target: dict = {}
     for src, dst in MODEL_MAP.items():
         by_target.setdefault(dst, []).append(src)
@@ -979,6 +1014,48 @@ def main():
     print(f"  ANTHROPIC_BASE_URL=http://{args.host}:{args.port} ANTHROPIC_API_KEY=dummy claude")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Anthropic -> OpenAI proxy")
+    sub = parser.add_subparsers(dest="command")
+
+    # --- serve ---
+    p_serve = sub.add_parser("serve", help="Start the proxy server")
+    _add_common_args(p_serve)
+    p_serve.add_argument("--port", type=int, default=int(os.environ.get("PROXY_PORT", "8082")))
+    p_serve.add_argument("--host", default=os.environ.get("PROXY_HOST", "127.0.0.1"))
+    p_serve.add_argument("--default-model", default=os.environ.get("DEFAULT_MODEL", "gpt-5.4"))
+    p_serve.add_argument(
+        "--model-map",
+        nargs="*",
+        metavar="CLAUDE=OPENAI",
+        help=(
+            "Model mapping pairs. Supports short aliases (opus, sonnet, haiku) "
+            "or full model IDs. Examples: haiku=openai/gpt-5.4-nano "
+            "opus=openai/gpt-5.4 claude-sonnet-4-6=openai/gpt-5.4-mini. "
+            "Also reads MODEL_MAP env var (comma-separated)."
+        ),
+    )
+    p_serve.add_argument(
+        "--debug",
+        action="store_true",
+        default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
+        help="Enable debug logging of all requests/responses to stderr",
+    )
+
+    # --- models ---
+    p_models = sub.add_parser("models", help="List models available at upstream endpoint")
+    _add_common_args(p_models)
+
+    args = parser.parse_args()
+
+    if args.command == "serve":
+        cmd_serve(args)
+    elif args.command == "models":
+        cmd_models(args)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
