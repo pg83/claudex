@@ -11,8 +11,11 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import os
+import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional, Tuple, Union
@@ -30,6 +33,7 @@ CONFIG = {
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "default_model": "gpt-5.4",
+    "debug": False,
 }
 
 MODEL_MAP: dict = {
@@ -79,6 +83,85 @@ def to_openai_tool_id(anthropic_id: str) -> str:
 
 def sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Debug logging
+# ---------------------------------------------------------------------------
+
+_REQ_COUNTER = 0
+
+
+def _next_req_id() -> str:
+    global _REQ_COUNTER
+    _REQ_COUNTER += 1
+    return f"#{_REQ_COUNTER:04d}"
+
+
+def _truncate_str(s: str, limit: int = 200) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"...[{len(s)} chars total]"
+
+
+def _truncate_obj(obj, depth: int = 0):
+    """Deep-copy obj with large strings truncated for readable logging."""
+    if depth > 20:
+        return "...[depth limit]"
+    if isinstance(obj, str):
+        # Base64 data — very aggressive truncation
+        if len(obj) > 200 and (obj[:20].replace("+", "").replace("/", "").replace("=", "").isalnum()):
+            return obj[:50] + f"...[base64, {len(obj)} chars]"
+        return _truncate_str(obj, 500)
+    if isinstance(obj, dict):
+        return {k: _truncate_obj(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if len(obj) > 30:
+            return [_truncate_obj(x, depth + 1) for x in obj[:10]] + [f"...[{len(obj)} items total]"]
+        return [_truncate_obj(x, depth + 1) for x in obj]
+    return obj
+
+
+def debug_log(header: str, data=None, req_id: str = "", **extra):
+    """Print a formatted debug block to stderr."""
+    if not CONFIG["debug"]:
+        return
+    ts = time.strftime("%H:%M:%S")
+    tag = f"[{ts}] {req_id} " if req_id else f"[{ts}] "
+    meta = " | ".join(f"{k}={v}" for k, v in extra.items()) if extra else ""
+    sep = "\u2550" * 50
+    print(f"\n{sep}", file=sys.stderr)
+    print(f"{tag}{header}" + (f" | {meta}" if meta else ""), file=sys.stderr)
+    print(sep, file=sys.stderr)
+    if data is not None:
+        if isinstance(data, (dict, list)):
+            truncated = _truncate_obj(data)
+            print(json.dumps(truncated, indent=2, ensure_ascii=False), file=sys.stderr)
+        else:
+            print(str(data), file=sys.stderr)
+    sys.stderr.flush()
+
+
+def debug_sse(direction: str, event_str: str, req_id: str = ""):
+    """Log a single SSE event as a compact one-liner."""
+    if not CONFIG["debug"]:
+        return
+    ts = time.strftime("%H:%M:%S")
+    # Parse the event for a compact representation
+    lines = event_str.strip().split("\n")
+    etype = ""
+    edata = ""
+    for ln in lines:
+        if ln.startswith("event: "):
+            etype = ln[7:]
+        elif ln.startswith("data: "):
+            edata = ln[6:]
+    # Truncate data for one-liner
+    if len(edata) > 300:
+        edata = edata[:300] + "..."
+    arrow = "<<" if direction == "in" else ">>"
+    print(f"[{ts}] {req_id} {arrow} SSE {etype}: {edata}", file=sys.stderr)
+    sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +535,7 @@ def close_block_events(state: StreamState) -> list[str]:
 async def stream_translate(
     openai_response: httpx.Response,
     anthropic_model: str,
+    req_id: str = "",
 ) -> AsyncIterator[str]:
     """Translate OpenAI SSE stream to Anthropic SSE events."""
     state = StreamState(anthropic_model)
@@ -474,11 +558,18 @@ async def stream_translate(
     yield sse_event("ping", {"type": "ping"})
 
     finish_reason = None
+    _chunk_count = 0
 
     try:
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
+                if CONFIG["debug"]:
+                    debug_sse("in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
                 break
+
+            _chunk_count += 1
+            if CONFIG["debug"]:
+                debug_sse("in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
             if choices:
@@ -582,6 +673,13 @@ async def stream_translate(
 
     yield sse_event("message_stop", {"type": "message_stop"})
 
+    debug_log("STREAM COMPLETE", req_id=req_id,
+              chunks=_chunk_count,
+              blocks=state.block_index,
+              stop=stop_reason,
+              input_tokens=state.input_tokens,
+              output_tokens=state.output_tokens)
+
 
 # ---------------------------------------------------------------------------
 # OpenAI HTTP client
@@ -613,6 +711,13 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
         return resp.json()
 
 
+async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncIterator[str]:
+    """Wrap an SSE generator to log each outgoing Anthropic event."""
+    async for event_str in gen:
+        debug_sse("out", event_str, req_id=req_id)
+        yield event_str
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -620,6 +725,8 @@ async def call_openai(openai_body: dict, stream: bool) -> Union[httpx.Response, 
 
 @app.post("/v1/messages")
 async def create_message(request: Request):
+    req_id = _next_req_id()
+
     try:
         body = await request.json()
     except Exception:
@@ -631,6 +738,11 @@ async def create_message(request: Request):
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
 
+    debug_log("ANTHROPIC REQUEST", body, req_id=req_id,
+              model=anthropic_model, stream=is_stream,
+              messages=len(body.get("messages", [])),
+              tools=len(body.get("tools", [])))
+
     try:
         openai_body = convert_request(body)
     except Exception as e:
@@ -639,26 +751,40 @@ async def create_message(request: Request):
             "error": {"type": "invalid_request_error", "message": f"Request conversion error: {e}"},
         })
 
+    debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
+              model=openai_body.get("model", ""),
+              messages=len(openai_body.get("messages", [])))
+
     try:
         if is_stream:
             openai_resp = await call_openai(openai_body, stream=True)
             return StreamingResponse(
-                stream_translate(openai_resp, anthropic_model),
+                _debug_stream_wrap(
+                    stream_translate(openai_resp, anthropic_model, req_id=req_id),
+                    req_id,
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         else:
             openai_resp = await call_openai(openai_body, stream=False)
-            return JSONResponse(content=convert_response(openai_resp, anthropic_model))
+            debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
+                      finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
+            anthropic_resp = convert_response(openai_resp, anthropic_model)
+            debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+                      stop=anthropic_resp.get("stop_reason"))
+            return JSONResponse(content=anthropic_resp)
 
     except httpx.HTTPStatusError as e:
         try:
             error_body = e.response.json()
         except Exception:
             error_body = None
+        debug_log("OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
         status, err = translate_error(e.response.status_code, error_body)
         return JSONResponse(status_code=status, content=err)
     except Exception as e:
+        debug_log("PROXY ERROR", {"error": str(e)}, req_id=req_id)
         return JSONResponse(status_code=500, content={
             "type": "error",
             "error": {"type": "api_error", "message": str(e)},
@@ -750,6 +876,12 @@ def main():
         metavar="CLAUDE=OPENAI",
         help="Model mapping pairs, e.g. claude-sonnet-4-6=gpt-5.4",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
+        help="Enable debug logging of all requests/responses to stderr",
+    )
     args = parser.parse_args()
 
     if not args.openai_api_key:
@@ -758,6 +890,7 @@ def main():
     CONFIG["openai_api_key"] = args.openai_api_key
     CONFIG["openai_base_url"] = args.openai_base_url
     CONFIG["default_model"] = args.default_model
+    CONFIG["debug"] = args.debug
 
     # Default model map
     MODEL_MAP.update({
@@ -781,6 +914,8 @@ def main():
     print(f"OpenAI base URL: {args.openai_base_url}")
     print(f"Default model: {args.default_model}")
     print(f"Model map: {MODEL_MAP}")
+    if CONFIG["debug"]:
+        print("Debug logging: ENABLED (stderr)")
     print()
     print("Usage:")
     print(f"  ANTHROPIC_BASE_URL=http://{args.host}:{args.port} ANTHROPIC_API_KEY=dummy claude")
