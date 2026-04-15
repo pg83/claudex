@@ -37,6 +37,9 @@ CONFIG = {
     "openai_base_url": "https://api.openai.com/v1",
     "default_model": "gpt-5.4",
     "debug": False,
+    "compress_model": "",       # empty = disabled
+    "compress_keep": 4,         # recent messages to keep verbatim
+    "compress_min": 8,          # min messages before compression kicks in
 }
 
 MODEL_MAP: dict = {
@@ -132,7 +135,7 @@ def sse_event(event_type: str, data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Debug logging
+# Debug logging (JSONL to stderr)
 # ---------------------------------------------------------------------------
 
 _REQ_COUNTER = 0
@@ -144,56 +147,43 @@ def _next_req_id() -> str:
     return f"#{_REQ_COUNTER:04d}"
 
 
-def _truncate_str(s: str, limit: int = 200) -> str:
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f"...[{len(s)} chars total]"
-
-
 def _truncate_obj(obj, depth: int = 0):
-    """Deep-copy obj with large strings truncated for readable logging."""
+    """Deep-copy obj with large strings truncated for logging."""
     if depth > 20:
         return "...[depth limit]"
     if isinstance(obj, str):
-        # Base64 data — very aggressive truncation
         if len(obj) > 200 and (obj[:20].replace("+", "").replace("/", "").replace("=", "").isalnum()):
             return obj[:50] + f"...[base64, {len(obj)} chars]"
-        return _truncate_str(obj, 500)
+        if len(obj) > 500:
+            return obj[:500] + f"...[{len(obj)} chars]"
+        return obj
     if isinstance(obj, dict):
         return {k: _truncate_obj(v, depth + 1) for k, v in obj.items()}
     if isinstance(obj, list):
         if len(obj) > 30:
-            return [_truncate_obj(x, depth + 1) for x in obj[:10]] + [f"...[{len(obj)} items total]"]
+            return [_truncate_obj(x, depth + 1) for x in obj[:10]] + [f"...[{len(obj)} items]"]
         return [_truncate_obj(x, depth + 1) for x in obj]
     return obj
 
 
-def debug_log(header: str, data=None, req_id: str = "", **extra):
-    """Print a formatted debug block to stderr."""
+def debug_log(event: str, data=None, req_id: str = "", **extra):
+    """Write one JSONL line to stderr."""
     if not CONFIG["debug"]:
         return
-    ts = time.strftime("%H:%M:%S")
-    tag = f"[{ts}] {req_id} " if req_id else f"[{ts}] "
-    meta = " | ".join(f"{k}={v}" for k, v in extra.items()) if extra else ""
-    sep = "\u2550" * 50
-    print(f"\n{sep}", file=sys.stderr)
-    print(f"{tag}{header}" + (f" | {meta}" if meta else ""), file=sys.stderr)
-    print(sep, file=sys.stderr)
+    record = {"ts": time.strftime("%H:%M:%S"), "event": event}
+    if req_id:
+        record["req"] = req_id
+    record.update(extra)
     if data is not None:
-        if isinstance(data, (dict, list)):
-            truncated = _truncate_obj(data)
-            print(json.dumps(truncated, indent=2, ensure_ascii=False), file=sys.stderr)
-        else:
-            print(str(data), file=sys.stderr)
+        record["data"] = _truncate_obj(data)
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
     sys.stderr.flush()
 
 
 def debug_sse(direction: str, event_str: str, req_id: str = ""):
-    """Log a single SSE event as a compact one-liner."""
+    """Log a single SSE chunk as one JSONL line."""
     if not CONFIG["debug"]:
         return
-    ts = time.strftime("%H:%M:%S")
-    # Parse the event for a compact representation
     lines = event_str.strip().split("\n")
     etype = ""
     edata = ""
@@ -202,11 +192,19 @@ def debug_sse(direction: str, event_str: str, req_id: str = ""):
             etype = ln[7:]
         elif ln.startswith("data: "):
             edata = ln[6:]
-    # Truncate data for one-liner
     if len(edata) > 300:
         edata = edata[:300] + "..."
-    arrow = "<<" if direction == "in" else ">>"
-    print(f"[{ts}] {req_id} {arrow} SSE {etype}: {edata}", file=sys.stderr)
+    record = {
+        "ts": time.strftime("%H:%M:%S"),
+        "event": "sse",
+        "req": req_id,
+        "dir": direction,
+    }
+    if etype:
+        record["sse_type"] = etype
+    if edata:
+        record["sse_data"] = edata
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
     sys.stderr.flush()
 
 
@@ -657,13 +655,19 @@ async def stream_translate(
                         tc_idx = tc_delta.get("index", 0)
 
                         if tc_idx != state.current_tool_index:
+                            # Each tool call is a separate block — force close previous
+                            for ev in close_block_events(state):
+                                yield ev
                             tool_id = to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
                             tool_name = tc_delta.get("function", {}).get("name", "")
-                            for ev in open_block_events(state, "tool_use", {
-                                "type": "tool_use", "id": tool_id, "name": tool_name, "input": {},
-                            }):
-                                yield ev
+                            state.current_block_type = "tool_use"
                             state.current_tool_index = tc_idx
+                            yield sse_event("content_block_start", {
+                                "index": state.block_index,
+                                "content_block": {
+                                    "type": "tool_use", "id": tool_id, "name": tool_name, "input": {},
+                                },
+                            })
 
                         # Stream arguments as input_json_delta
                         args_chunk = tc_delta.get("function", {}).get("arguments", "")
@@ -744,6 +748,162 @@ async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncItera
 
 
 # ---------------------------------------------------------------------------
+# Context compression
+# ---------------------------------------------------------------------------
+
+COMPRESS_PROMPT = (
+    "Summarize this conversation between a user and an AI coding assistant. "
+    "Preserve: what was asked, what files were read or changed, what tools were "
+    "called and their key results, decisions made, current state of the task. "
+    "Be concise but complete enough that the assistant can continue the work. "
+    "Output only the summary, no preamble."
+)
+
+
+def _has_block_type(content, btype: str) -> bool:
+    """Check if a message content (str or list) contains blocks of the given type."""
+    if not isinstance(content, list):
+        return False
+    return any(b.get("type") == btype for b in content)
+
+
+def find_safe_split(messages: list, keep: int) -> int:
+    """Find the split point that doesn't break tool_use -> tool_result chains.
+
+    Returns index i such that messages[:i] can be compressed and
+    messages[i:] stay verbatim. The last `keep` messages are always kept.
+
+    Strategy: start at len-keep, then walk BACKWARD to find a clean boundary.
+    A clean boundary is a position where the message AT that index is NOT
+    a tool_result (i.e. we don't start the kept tail mid-chain).
+    """
+    boundary = len(messages) - keep
+    if boundary < 2:
+        return 0
+    # Walk backward from boundary: find a position where messages[i]
+    # is not a tool_result continuation
+    for i in range(boundary, 1, -1):
+        msg = messages[i]  # first message in the kept tail
+        content = msg.get("content", "")
+        # If this message is a tool_result, the tool_use before it
+        # would be orphaned — keep walking back
+        if msg["role"] == "user" and _has_block_type(content, "tool_result"):
+            continue
+        return i
+    return 0  # can't find a safe split, don't compress
+
+
+def _truncate(s: str, limit: int = 500) -> str:
+    return s if len(s) <= limit else s[:limit] + f"...[{len(s)} chars]"
+
+
+def serialize_messages(messages: list) -> str:
+    """Serialize Anthropic messages to a readable text format for compression."""
+    lines = []
+    for msg in messages:
+        role = msg["role"].upper()
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            lines.append(f"{role}: {_truncate(content)}")
+        elif isinstance(content, list):
+            parts = []
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text":
+                    parts.append(_truncate(block.get("text", "")))
+                elif btype == "tool_use":
+                    inp = json.dumps(block.get("input", {}))
+                    parts.append(f"[tool_use: {block.get('name', '?')}({_truncate(inp, 200)})]")
+                elif btype == "tool_result":
+                    sub = block.get("content", "")
+                    if isinstance(sub, str):
+                        text = sub
+                    elif isinstance(sub, list):
+                        text = " ".join(b.get("text", "") for b in sub if b.get("type") == "text")
+                    else:
+                        text = str(sub)
+                    status = "error" if block.get("is_error") else "ok"
+                    parts.append(f"[tool_result({status}): {_truncate(text, 300)}]")
+                elif btype == "thinking":
+                    parts.append(f"[thinking: {_truncate(block.get('thinking', ''), 200)}]")
+            lines.append(f"{role}: {' '.join(parts)}")
+        else:
+            lines.append(f"{role}: {_truncate(str(content))}")
+    return "\n".join(lines)
+
+
+async def call_compress_llm(messages: list) -> str:
+    """Send messages to the cheap compression model and return summary text."""
+    serialized = serialize_messages(messages)
+
+    compress_body = {
+        "model": CONFIG["compress_model"],
+        "messages": [
+            {"role": "developer", "content": COMPRESS_PROMPT},
+            {"role": "user", "content": f"<conversation>\n{serialized}\n</conversation>"},
+        ],
+        "max_tokens": 2048,
+        "temperature": 0,
+        "stream": False,
+    }
+
+    # Use the same HTTP client / auth / URL as regular requests
+    headers = {
+        "Authorization": f"Bearer {CONFIG['openai_api_key']}",
+        "Content-Type": "application/json",
+    }
+    url = _strip_chat_suffix(CONFIG["openai_base_url"]) + "/chat/completions"
+
+    resp = await http_client.post(url, json=compress_body, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    if "response" in data and "choices" not in data:
+        data = data["response"]
+
+    return data["choices"][0]["message"]["content"] or ""
+
+
+async def compress_context(messages: list, req_id: str = "") -> list:
+    """Compress old messages via cheap LLM, keeping recent ones verbatim."""
+    keep = CONFIG["compress_keep"]
+    min_msgs = CONFIG["compress_min"]
+
+    if len(messages) < min_msgs:
+        return messages
+
+    split = find_safe_split(messages, keep)
+    if split <= 0:
+        return messages
+
+    to_compress = messages[:split]
+    tail = messages[split:]
+
+    original_chars = sum(len(json.dumps(m.get("content", ""))) for m in messages)
+
+    try:
+        summary = await call_compress_llm(to_compress)
+    except Exception as e:
+        debug_log("COMPRESS ERROR", {"error": str(e)}, req_id=req_id)
+        return messages  # fallback: no compression
+
+    compressed = [
+        {"role": "user", "content": f"<context-summary>\n{summary}\n</context-summary>"},
+        {"role": "assistant", "content": "Understood, I have the conversation context."},
+        *tail,
+    ]
+
+    debug_log("CONTEXT COMPRESSION", req_id=req_id,
+              original_msgs=len(messages),
+              compressed_to=len(compressed),
+              kept_verbatim=len(tail),
+              original_chars=original_chars,
+              summary_chars=len(summary),
+              model=CONFIG["compress_model"])
+
+    return compressed
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -764,6 +924,10 @@ async def create_message(request: Request):
               model=anthropic_model, stream=is_stream,
               messages=len(body.get("messages", [])),
               tools=len(body.get("tools", [])))
+
+    # Context compression
+    if CONFIG["compress_model"] and "messages" in body:
+        body["messages"] = await compress_context(body["messages"], req_id=req_id)
 
     try:
         openai_body = convert_request(body)
@@ -944,6 +1108,9 @@ def cmd_serve(args: argparse.Namespace):
     CONFIG["default_model"] = args.default_model
     CONFIG["debug"] = args.debug
     CONFIG["no_ssl_verify"] = args.no_ssl_verify
+    CONFIG["compress_model"] = args.compress_model
+    CONFIG["compress_keep"] = args.compress_keep
+    CONFIG["compress_min"] = args.compress_min
 
     # Build model map: start with all known models -> default
     default = args.default_model
@@ -977,6 +1144,8 @@ def cmd_serve(args: argparse.Namespace):
     print("Model map:")
     for target, sources in by_target.items():
         print(f"  {target} <- {', '.join(sources)}")
+    if CONFIG["compress_model"]:
+        print(f"Context compression: {CONFIG['compress_model']} (keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']})")
     if CONFIG["debug"]:
         print("Debug logging: ENABLED (stderr)")
     print()
@@ -1012,6 +1181,21 @@ def main():
         action="store_true",
         default=env_bool("DEBUG"),
         help="Enable debug logging of all requests/responses to stderr",
+    )
+    p_serve.add_argument(
+        "--compress-model",
+        default=os.environ.get("COMPRESS_MODEL", ""),
+        help="Model for context compression (enables compression). E.g. google/gemini-2.5-flash-lite",
+    )
+    p_serve.add_argument(
+        "--compress-keep", type=int,
+        default=int(os.environ.get("COMPRESS_KEEP", "4")),
+        help="Recent messages to keep verbatim (default: 4)",
+    )
+    p_serve.add_argument(
+        "--compress-min", type=int,
+        default=int(os.environ.get("COMPRESS_MIN", "8")),
+        help="Min messages before compression kicks in (default: 8)",
     )
 
     # --- models ---
