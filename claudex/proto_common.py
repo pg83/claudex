@@ -1,5 +1,6 @@
 import json
 import uuid
+import hashlib
 
 from typing import AsyncIterator, Optional
 
@@ -79,6 +80,17 @@ def extract_last_user_text(messages: list) -> str:
             return extract_text_content(msg.get("content", ""))
 
     return ""
+
+
+def session_id(messages: list) -> str:
+    for m in messages:
+        if m.get("role") == "user":
+            text = extract_text_content(m.get("content", ""))
+
+            if text:
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+    return "nosess"
 
 
 def count_content_chars(content) -> int:

@@ -60,10 +60,10 @@ class ProxyServer:
 
     # ----- proxy-handled tools -----
 
-    async def execute_proxy_tool(self, name: str, tool_input: dict, req_id: str = "") -> str:
+    async def execute_proxy_tool(self, name: str, tool_input: dict, sid: str = "", req_id: str = "") -> str:
         if name == "WebFetch":
             url = tool_input.get("url", "")
-            lg.log(f"web_fetch {url}", req_id=req_id)
+            lg.log(f"web_fetch {url}", sid=sid)
             resp = await self.client().get(url, headers=pc.FETCH_HEADERS, timeout=15, follow_redirects=True)
             result = resp.text
             lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
@@ -72,7 +72,7 @@ class ProxyServer:
 
         if name in ("WebSearch", "web_search"):
             query = tool_input.get("query", "")
-            lg.log(f"web_search {query}", req_id=req_id)
+            lg.log(f"web_search {query}", sid=sid)
 
             resp = await self.client().get(
                 "https://html.duckduckgo.com/html/",
@@ -113,7 +113,7 @@ class ProxyServer:
 
         return data["choices"][0]["message"]["content"] or ""
 
-    async def compress_context(self, messages: list, req_id: str = "") -> list:
+    async def compress_context(self, messages: list, sid: str = "", req_id: str = "") -> list:
         keep = self.config["compress_keep"]
         min_msgs = self.config["compress_min"]
 
@@ -136,7 +136,7 @@ class ProxyServer:
         ratio = original_total / compressed_bytes if compressed_bytes else 0
 
         lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
-            req_id=req_id)
+            sid=sid)
 
         lg.debug_log(self.config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
                   original_msgs=len(messages),
@@ -149,12 +149,12 @@ class ProxyServer:
 
     # ----- RAG enrichment -----
 
-    def enrich_with_rag(self, body: dict, req_id: str):
+    def enrich_with_rag(self, body: dict, sid: str, req_id: str):
         for msg in body.get("messages", []):
             text = pc.extract_msg_text(msg)
 
             if text:
-                self.rag.add(f"conversation/{req_id}/{msg['role']}", text)
+                self.rag.add(f"conversation/{sid}/{msg['role']}", text)
 
         last_text = pc.extract_last_user_text(body.get("messages", []))
 
@@ -185,12 +185,12 @@ class ProxyServer:
                 break
 
         q_preview = last_text[:200].replace("\n", " ")
-        lg.log(f"rag query: {q_preview!r}", req_id=req_id)
+        lg.log(f"rag query: {q_preview!r}", sid=sid)
 
         for r in rag_results:
             data_preview = r["data"][:200].replace("\n", " ")
             paths = ", ".join(r["paths"])
-            lg.log(f"  rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", req_id=req_id)
+            lg.log(f"  rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", sid=sid)
 
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
@@ -204,6 +204,7 @@ class ProxyServer:
         except Exception:
             return pc.error_response(400, "invalid_request_error", "Invalid JSON body")
 
+        sid = pc.session_id(body.get("messages", []))
         anthropic_model = body.get("model", "")
         is_stream = body.get("stream", False)
         ep = cx.resolve_endpoint(self.config, anthropic_model)
@@ -213,18 +214,18 @@ class ProxyServer:
         stream_tag = "stream" if is_stream else "sync"
 
         lg.log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {lg.human_bytes(body_bytes)}, {stream_tag}",
-            req_id=req_id)
+            sid=sid)
 
         lg.debug_log(self.config, "ANTHROPIC REQUEST", body, req_id=req_id,
-                  model=anthropic_model, stream=is_stream,
+                  sid=sid, model=anthropic_model, stream=is_stream,
                   endpoint_model=ep["model"],
                   messages=n_msgs, tools=n_tools)
 
         if "compress" in self.config["endpoints"] and "messages" in body:
-            body["messages"] = await self.compress_context(body["messages"], req_id=req_id)
+            body["messages"] = await self.compress_context(body["messages"], sid=sid, req_id=req_id)
 
         if self.rag is not None:
-            self.enrich_with_rag(body, req_id)
+            self.enrich_with_rag(body, sid, req_id)
 
         body["model"] = ep["model"]
 
@@ -234,30 +235,30 @@ class ProxyServer:
             upper = uo.OpenAIUpper(self, ep)
 
         try:
-            return await self._lower_handle(upper, body, anthropic_model, req_id, request.headers, is_stream)
+            return await self._lower_handle(upper, body, anthropic_model, sid, req_id, request.headers, is_stream)
         except httpx.HTTPStatusError as e:
             try:
                 error_body = e.response.json()
             except Exception:
                 error_body = None
 
-            lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
-            lg.debug_log(self.config, "UPSTREAM ERROR", error_body, req_id=req_id, status=e.response.status_code)
+            lg.log(f"ERROR {e.response.status_code}", sid=sid)
+            lg.debug_log(self.config, "UPSTREAM ERROR", error_body, req_id=req_id, sid=sid, status=e.response.status_code)
 
             return pc.translate_openai_error(e.response.status_code, error_body)
 
         except Exception as e:
-            lg.log(f"ERROR {e}", req_id=req_id)
-            lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
+            lg.log(f"ERROR {e}", sid=sid)
+            lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id, sid=sid)
 
             return pc.error_response(500, "api_error", str(e))
 
-    async def _lower_handle(self, upper, body: dict, anthropic_model: str, req_id: str, client_headers, is_stream: bool):
+    async def _lower_handle(self, upper, body: dict, anthropic_model: str, sid: str, req_id: str, client_headers, is_stream: bool):
         proto = type(upper).__name__
 
         if is_stream:
-            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, stream=True, proto=proto)
-            iterator = await upper.stream(body, client_headers, req_id)
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, stream=True, proto=proto)
+            iterator = await upper.stream(body, client_headers, sid)
 
             return StreamingResponse(
                 pc.debug_stream_wrap(iterator, self.config, req_id),
@@ -268,10 +269,10 @@ class ProxyServer:
         resp: dict = {}
 
         for _ in range(6):
-            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, proto=proto,
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, proto=proto,
                       messages=len(body.get("messages", [])))
-            resp = await upper.call(body, client_headers, req_id)
-            lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, proto=proto,
+            resp = await upper.call(body, client_headers, sid)
+            lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, sid=sid, proto=proto,
                       stop=resp.get("stop_reason"))
 
             proxy_uses = pc.extract_proxy_tool_uses(resp)
@@ -285,10 +286,10 @@ class ProxyServer:
 
             for tu in proxy_uses:
                 try:
-                    result = await self.execute_proxy_tool(tu["name"], tu.get("input", {}), req_id=req_id)
+                    result = await self.execute_proxy_tool(tu["name"], tu.get("input", {}), sid=sid, req_id=req_id)
                 except Exception as e:
                     result = f"Error: {e}"
-                    lg.log(f"tool error {tu['name']}: {e}", req_id=req_id)
+                    lg.log(f"tool error {tu['name']}: {e}", sid=sid)
 
                 tool_results.append({
                     "type": "tool_result",
@@ -302,8 +303,8 @@ class ProxyServer:
 
         usage = resp.get("usage", {})
         lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {resp.get('stop_reason','')}",
-            req_id=req_id)
-        lg.debug_log(self.config, "ANTHROPIC RESPONSE", resp, req_id=req_id,
+            sid=sid)
+        lg.debug_log(self.config, "ANTHROPIC RESPONSE", resp, req_id=req_id, sid=sid,
                   stop=resp.get("stop_reason"))
 
         return JSONResponse(content=resp)

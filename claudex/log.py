@@ -21,11 +21,13 @@ def next_req_id() -> str:
     return f"#{_REQ_COUNTER:04d}"
 
 
-def log(msg: str, req_id: str = ""):
+def log(msg: str, sid: str = ""):
     ts = time.strftime("%H:%M:%S")
-    prefix = f"{ts} {req_id} " if req_id else f"{ts} "
 
-    print(f"{prefix}{msg}", file=sys.stderr, flush=True)
+    if sid:
+        print(f"{ts} | {sid} | {msg}", file=sys.stderr, flush=True)
+    else:
+        print(f"{ts} | {msg}", file=sys.stderr, flush=True)
 
 
 def human_bytes(n: int) -> str:
@@ -38,7 +40,7 @@ def human_bytes(n: int) -> str:
     return f"{n/1024/1024:.1f}MB"
 
 
-def debug_log(config: dict, event: str, data=None, req_id: str = "", **extra):
+def debug_log(config: dict, event: str, data=None, req_id: str = "", sid: str = "", **extra):
     if not config.get("debug"):
         return
 
@@ -46,6 +48,9 @@ def debug_log(config: dict, event: str, data=None, req_id: str = "", **extra):
 
     if req_id:
         record["req"] = req_id
+
+    if sid:
+        record["sid"] = sid
 
     record.update(extra)
 
@@ -55,7 +60,7 @@ def debug_log(config: dict, event: str, data=None, req_id: str = "", **extra):
     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def debug_sse(config: dict, direction: str, event_str: str, req_id: str = ""):
+def debug_sse(config: dict, direction: str, event_str: str, req_id: str = "", sid: str = ""):
     if not config.get("debug"):
         return
 
@@ -75,9 +80,14 @@ def debug_sse(config: dict, direction: str, event_str: str, req_id: str = ""):
     record = {
         "ts": time.strftime("%H:%M:%S"),
         "event": "sse",
-        "req": req_id,
         "dir": direction,
     }
+
+    if req_id:
+        record["req"] = req_id
+
+    if sid:
+        record["sid"] = sid
 
     if etype:
         record["sse_type"] = etype

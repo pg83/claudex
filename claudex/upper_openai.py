@@ -364,7 +364,7 @@ async def stream_translate(
     openai_response: httpx.Response,
     anthropic_model: str,
     config: dict,
-    req_id: str = "",
+    sid: str = "",
 ) -> AsyncIterator[str]:
     state = StreamState(anthropic_model)
 
@@ -390,13 +390,13 @@ async def stream_translate(
     try:
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
-                lg.debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
+                lg.debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", sid=sid)
 
                 break
 
             chunk_count += 1
             raw_chunks.append(chunk)
-            lg.debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
+            lg.debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", sid=sid)
 
             choices = chunk.get("choices", [])
 
@@ -480,8 +480,8 @@ async def stream_translate(
     yield pc.sse_event("message_stop", {})
 
     lg.log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
-        req_id=req_id)
-    lg.debug_log(config, "OPENAI RESPONSE (stream)", raw_chunks, req_id=req_id,
+        sid=sid)
+    lg.debug_log(config, "OPENAI RESPONSE (stream)", raw_chunks, sid=sid,
               chunks=chunk_count,
               stop=stop_reason,
               input_tokens=state.input_tokens,
@@ -543,7 +543,7 @@ class OpenAIUpper:
 
         return data
 
-    async def call(self, body: dict, client_headers, req_id: str) -> dict:
+    async def call(self, body: dict, client_headers, sid: str) -> dict:
         openai_body = convert_request(body, body["model"])
         openai_body["stream"] = False
         openai_body.pop("stream_options", None)
@@ -552,11 +552,11 @@ class OpenAIUpper:
 
         return convert_response(openai_resp, body["model"])
 
-    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
+    async def stream(self, body: dict, client_headers, sid: str) -> AsyncIterator[str]:
         openai_body = convert_request(body, body["model"])
         openai_body["stream"] = True
         openai_body["stream_options"] = {"include_usage": True}
 
         resp = await self._post(openai_body, client_headers, stream=True)
 
-        return stream_translate(resp, body["model"], self.server.config, req_id=req_id)
+        return stream_translate(resp, body["model"], self.server.config, sid=sid)

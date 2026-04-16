@@ -37,12 +37,12 @@ class AnthropicUpper:
 
         return resp
 
-    async def call(self, body: dict, client_headers, req_id: str) -> dict:
+    async def call(self, body: dict, client_headers, sid: str) -> dict:
         resp = await self._send(body, client_headers, stream=False)
 
         return resp.json()
 
-    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
+    async def stream(self, body: dict, client_headers, sid: str) -> AsyncIterator[str]:
         resp = await self._send(body, client_headers, stream=True)
 
         return _iter_chunks(resp)
