@@ -173,10 +173,7 @@ class ProxyServer:
         if not hits:
             return
 
-        block = "\n".join(
-            f"[{h['engine']}] {', '.join(h['paths'])}\n---\n{h['data']}\n---"
-            for h in hits
-        )
+        block = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
         messages = body.get("messages", [])
 
         suffix = f"\n---\n<search>\n{block}\n</search>"
