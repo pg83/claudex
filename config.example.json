@@ -1,29 +1,14 @@
 {
-  "api_key": "$ELIZA_TOKEN",
   "listen": "127.0.0.1:18080",
 
   "endpoints": {
-    "sonnet": {
-      "base_url": "https://api.eliza.yandex.net/internal/glm-latest/v1",
-      "model": "/genesis/model"
-    },
     "opus": {
-      "base_url": "https://api.eliza.yandex.net/internal/kimi-k2-5/v1",
-      "model": "/genesis/model"
-    },
-    "opus1": {
-      "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
-      "model": "gpt-5.4-mini"
-    },
-    "haiku": {
       "base_url": "https://api.anthropic.com/v1",
       "model": "claude-haiku-4-5"
     }
   },
 
-  "compress_keep": 4,
-  "compress_min": 8,
-  "rag_dir": ["./", "/home/pg/std"],
+  "rag_dir": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
   "rag_max_results": 4,
   "rag_chunk_size": 2000
 }
