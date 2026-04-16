@@ -2,7 +2,19 @@ import httpx
 
 from typing import AsyncIterator
 
-import claudex.proto_common as pc
+
+HOP_BY_HOP = frozenset({"host", "content-length", "connection", "transfer-encoding", "accept-encoding"})
+
+
+def upstream_headers(client_headers, ep: dict) -> dict:
+    out = {k: v for k, v in dict(client_headers).items() if k.lower() not in HOP_BY_HOP}
+
+    if ep["api_key"]:
+        out["x-api-key"] = ep["api_key"]
+        out.pop("authorization", None)
+        out.pop("Authorization", None)
+
+    return out
 
 
 class AnthropicUpper:
@@ -10,31 +22,10 @@ class AnthropicUpper:
         self.server = server
         self.ep = ep
 
-    def _headers(self, client_headers) -> dict:
-        out = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
-
-        if client_headers:
-            for h in pc.FORWARD_HEADERS:
-                v = client_headers.get(h)
-
-                if v:
-                    out[h] = v
-
-        if self.ep["api_key"]:
-            out["x-api-key"] = self.ep["api_key"]
-        elif client_headers:
-            for h in ("authorization", "x-api-key"):
-                v = client_headers.get(h)
-
-                if v:
-                    out[h] = v
-
-        return out
-
-    async def _send(self, body: dict, client_headers, stream: bool) -> httpx.Response:
+    async def _send(self, body: dict, headers: dict, stream: bool) -> httpx.Response:
         url = self.ep["base_url"].rstrip("/") + "/messages"
         http = self.server.client(self.ep.get("proxy"))
-        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=self._headers(client_headers))
+        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=headers)
         resp = await http.send(req, stream=stream)
 
         if resp.status_code != 200:
@@ -46,13 +37,13 @@ class AnthropicUpper:
 
         return resp
 
-    async def call(self, body: dict, client_headers, req_id: str) -> dict:
-        resp = await self._send(body, client_headers, stream=False)
+    async def call(self, body: dict, headers: dict, req_id: str) -> dict:
+        resp = await self._send(body, headers, stream=False)
 
         return resp.json()
 
-    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
-        resp = await self._send(body, client_headers, stream=True)
+    async def stream(self, body: dict, headers: dict, req_id: str) -> AsyncIterator[str]:
+        resp = await self._send(body, headers, stream=True)
 
         return _iter_chunks(resp)
 
