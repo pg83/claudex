@@ -20,7 +20,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import (
+from common import (
     CONFIG,
     ENDPOINTS,
     _strip_chat_suffix,

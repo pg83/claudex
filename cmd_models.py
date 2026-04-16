@@ -5,7 +5,7 @@ import sys
 
 import httpx
 
-from proxy import ENDPOINTS, _expand_env, _strip_chat_suffix, load_config
+from common import ENDPOINTS, _expand_env, _strip_chat_suffix, load_config
 
 
 def cmd_models(args: argparse.Namespace):
