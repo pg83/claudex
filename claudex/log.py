@@ -6,11 +6,15 @@
 """
 
 import sys
-import time
 import json
+import time
+import random
 
 
 _REQ_COUNTER = 0
+_SID_COLORS: dict[str, str] = {}
+_MAX_SID_COLORS = 1_000_000
+_RESET = "\033[0m"
 
 
 def next_req_id() -> str:
@@ -21,11 +25,30 @@ def next_req_id() -> str:
     return f"#{_REQ_COUNTER:04d}"
 
 
+def _color_for(sid: str) -> str:
+    c = _SID_COLORS.get(sid)
+
+    if c is not None:
+        return c
+
+    if len(_SID_COLORS) >= _MAX_SID_COLORS:
+        _SID_COLORS.clear()
+
+    r = random.randint(120, 255)
+    g = random.randint(120, 255)
+    b = random.randint(120, 255)
+    c = f"\033[38;2;{r};{g};{b}m"
+    _SID_COLORS[sid] = c
+
+    return c
+
+
 def log(msg: str, sid: str = ""):
     ts = time.strftime("%H:%M:%S")
 
     if sid:
-        print(f"{ts} | {sid} | {msg}", file=sys.stderr, flush=True)
+        color = _color_for(sid)
+        print(f"{ts} | {color}{sid}{_RESET} | {msg}", file=sys.stderr, flush=True)
     else:
         print(f"{ts} | {msg}", file=sys.stderr, flush=True)
 
