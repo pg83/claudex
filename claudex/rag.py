@@ -128,6 +128,9 @@ class RAG:
         added = 0
 
         for chunk in split_text(text, chunk_size):
+            if not chunk.strip():
+                continue
+
             doc = {"path": path, "data": chunk}
             chunk_json = json.dumps(doc, ensure_ascii=False, sort_keys=True)
             sha = hashlib.sha256(chunk_json.encode()).hexdigest()
