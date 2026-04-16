@@ -229,6 +229,8 @@ class ProxyServer:
         if self.rag is not None:
             self.enrich_with_rag(body, req_id)
 
+        body["model"] = ep["model"]
+
         if ep.get("protocol") == "anthropic":
             upper = ua.AnthropicUpper(self, ep)
         else:
@@ -254,7 +256,10 @@ class ProxyServer:
             return pc.error_response(500, "api_error", str(e))
 
     async def _lower_handle(self, upper, body: dict, anthropic_model: str, req_id: str, client_headers, is_stream: bool):
+        proto = type(upper).__name__
+
         if is_stream:
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, stream=True, proto=proto)
             iterator = await upper.stream(body, client_headers, req_id)
 
             return StreamingResponse(
@@ -266,7 +271,11 @@ class ProxyServer:
         resp: dict = {}
 
         for _ in range(6):
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, proto=proto,
+                      messages=len(body.get("messages", [])))
             resp = await upper.call(body, client_headers, req_id)
+            lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, proto=proto,
+                      stop=resp.get("stop_reason"))
 
             proxy_uses = pc.extract_proxy_tool_uses(resp)
 

@@ -539,35 +539,19 @@ class OpenAIUpper:
         return data
 
     async def call(self, body: dict, client_headers, req_id: str) -> dict:
-        anthropic_model = body.get("model", "")
-        openai_body = convert_request(body, self.ep["model"])
+        openai_body = convert_request(body, body["model"])
         openai_body["stream"] = False
         openai_body.pop("stream_options", None)
 
-        lg.debug_log(self.server.config, "OPENAI REQUEST", openai_body, req_id=req_id,
-                  model=openai_body.get("model", ""),
-                  base_url=self.ep["base_url"],
-                  messages=len(openai_body.get("messages", [])))
-
         openai_resp = await self._post(openai_body, stream=False, client_headers=client_headers)
 
-        lg.debug_log(self.server.config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
-                  finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
-
-        return convert_response(openai_resp, anthropic_model)
+        return convert_response(openai_resp, body["model"])
 
     async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
-        anthropic_model = body.get("model", "")
-        openai_body = convert_request(body, self.ep["model"])
+        openai_body = convert_request(body, body["model"])
         openai_body["stream"] = True
         openai_body["stream_options"] = {"include_usage": True}
 
-        lg.debug_log(self.server.config, "OPENAI REQUEST", openai_body, req_id=req_id,
-                  model=openai_body.get("model", ""),
-                  base_url=self.ep["base_url"],
-                  messages=len(openai_body.get("messages", [])),
-                  stream=True)
-
         resp = await self._post(openai_body, stream=True, client_headers=client_headers)
 
-        return stream_translate(resp, anthropic_model, self.server.config, req_id=req_id)
+        return stream_translate(resp, body["model"], self.server.config, req_id=req_id)

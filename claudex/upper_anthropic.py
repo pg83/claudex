@@ -1,46 +1,8 @@
 import httpx
 
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
-import claudex.log as lg
 import claudex.proto_common as pc
-
-
-def messages_url(base_url: str) -> str:
-    base = base_url.rstrip("/")
-
-    if base.endswith("/messages"):
-        return base
-
-    return base + "/messages"
-
-
-def anthropic_headers(api_key: str, client_headers) -> dict:
-    headers = {"content-type": "application/json"}
-
-    if client_headers:
-        for h in pc.FORWARD_HEADERS:
-            v = client_headers.get(h)
-
-            if v:
-                headers[h] = v
-
-    if api_key:
-        headers["x-api-key"] = api_key
-    elif client_headers:
-        auth = client_headers.get("authorization")
-
-        if auth:
-            headers["authorization"] = auth
-
-        xapi = client_headers.get("x-api-key")
-
-        if xapi:
-            headers["x-api-key"] = xapi
-
-    headers.setdefault("anthropic-version", "2023-06-01")
-
-    return headers
 
 
 class AnthropicUpper:
@@ -48,80 +10,56 @@ class AnthropicUpper:
         self.server = server
         self.ep = ep
 
-    def _upstream_body(self, body: dict, stream: bool) -> dict:
-        target = dict(body)
-        target["messages"] = list(body.get("messages", []))
-        target["model"] = self.ep["model"]
-        target["stream"] = stream
+    def _headers(self, client_headers) -> dict:
+        out = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
 
-        return target
+        if client_headers:
+            for h in pc.FORWARD_HEADERS:
+                v = client_headers.get(h)
 
-    async def call(self, body: dict, client_headers, req_id: str) -> dict:
-        target = self._upstream_body(body, stream=False)
+                if v:
+                    out[h] = v
 
-        lg.debug_log(self.server.config, "ANTHROPIC UPSTREAM REQUEST", target, req_id=req_id,
-                  model=target.get("model", ""),
-                  base_url=self.ep["base_url"],
-                  messages=len(target.get("messages", [])))
+        if self.ep["api_key"]:
+            out["x-api-key"] = self.ep["api_key"]
+        elif client_headers:
+            for h in ("authorization", "x-api-key"):
+                v = client_headers.get(h)
 
-        headers = anthropic_headers(self.ep["api_key"], client_headers)
-        url = messages_url(self.ep["base_url"])
+                if v:
+                    out[h] = v
 
-        resp = await self.server.client(self.ep.get("proxy")).post(url, json=target, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        return out
 
-        lg.debug_log(self.server.config, "ANTHROPIC UPSTREAM RESPONSE", data, req_id=req_id,
-                  stop=data.get("stop_reason"))
-
-        return data
-
-    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
-        target = self._upstream_body(body, stream=True)
-
-        lg.debug_log(self.server.config, "ANTHROPIC UPSTREAM REQUEST", target, req_id=req_id,
-                  model=target.get("model", ""),
-                  base_url=self.ep["base_url"],
-                  messages=len(target.get("messages", [])),
-                  stream=True)
-
-        headers = anthropic_headers(self.ep["api_key"], client_headers)
-        url = messages_url(self.ep["base_url"])
+    async def _send(self, body: dict, client_headers, stream: bool) -> httpx.Response:
+        url = self.ep["base_url"].rstrip("/") + "/messages"
         http = self.server.client(self.ep.get("proxy"))
-
-        req = http.build_request("POST", url, json=target, headers=headers)
-        resp = await http.send(req, stream=True)
+        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=self._headers(client_headers))
+        resp = await http.send(req, stream=stream)
 
         if resp.status_code != 200:
             await resp.aread()
 
             await resp.aclose()
 
-            raise httpx.HTTPStatusError(
-                f"Anthropic returned {resp.status_code}",
-                request=req,
-                response=resp,
-            )
+            raise httpx.HTTPStatusError(f"Anthropic {resp.status_code}", request=req, response=resp)
 
-        return _iter_passthrough(resp)
+        return resp
+
+    async def call(self, body: dict, client_headers, req_id: str) -> dict:
+        resp = await self._send(body, client_headers, stream=False)
+
+        return resp.json()
+
+    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
+        resp = await self._send(body, client_headers, stream=True)
+
+        return _iter_chunks(resp)
 
 
-async def _iter_passthrough(resp: httpx.Response) -> AsyncIterator[str]:
-    buffer = b""
-
+async def _iter_chunks(resp: httpx.Response) -> AsyncIterator[str]:
     try:
         async for chunk in resp.aiter_bytes():
-            buffer += chunk
-
-            while b"\n\n" in buffer:
-                event_bytes, buffer = buffer.split(b"\n\n", 1)
-
-                yield event_bytes.decode("utf-8", errors="replace") + "\n\n"
-
-        if buffer:
-            tail = buffer.decode("utf-8", errors="replace")
-
-            if tail.strip():
-                yield tail
+            yield chunk.decode("utf-8", errors="replace")
     finally:
         await resp.aclose()
