@@ -1,4 +1,4 @@
-"""serve subcommand: FastAPI proxy server."""
+"""serve subcommand: Starlette proxy server."""
 
 import argparse
 import json
@@ -11,8 +11,10 @@ from typing import AsyncIterator, Optional, Union
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 import claudex.common as cx
 import claudex.rag as rag_mod
@@ -39,12 +41,12 @@ def _messages_url(base_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app with shared http client
+# Starlette app with shared http client
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: Starlette):
     global http_client
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(300.0, connect=10.0),
@@ -52,9 +54,6 @@ async def lifespan(app: FastAPI):
     )
     yield
     await http_client.aclose()
-
-
-app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1084,6 @@ def _enrich_with_rag(body: dict, config: dict, req_id: str):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/v1/messages")
 async def create_message(request: Request):
     config = request.app.state.config
     req_id = _next_req_id()
@@ -1192,7 +1190,6 @@ def _count_content_chars(content) -> int:
     return 0
 
 
-@app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     try:
         body = await request.json()
@@ -1210,7 +1207,6 @@ async def count_tokens(request: Request):
     return JSONResponse(content={"input_tokens": max(1, total_chars // 4)})
 
 
-@app.get("/v1/models")
 async def list_models(request: Request):
     config = request.app.state.config
     endpoints = config.get("endpoints", {})
@@ -1224,6 +1220,16 @@ async def list_models(request: Request):
         ],
         "has_more": False,
     })
+
+
+app = Starlette(
+    lifespan=lifespan,
+    routes=[
+        Route("/v1/messages", create_message, methods=["POST"]),
+        Route("/v1/messages/count_tokens", count_tokens, methods=["POST"]),
+        Route("/v1/models", list_models, methods=["GET"]),
+    ],
+)
 
 
 # ---------------------------------------------------------------------------
