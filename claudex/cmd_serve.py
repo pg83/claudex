@@ -653,7 +653,7 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
             })
 
             yield sse_event("content_block_delta", {
-                "index": idx, "delta": {"type": "signature_delta", "signature": ""},
+                "index": idx, "delta": {"type": "signature_delta", "signature": block.get("signature", "")},
             })
 
             yield sse_event("content_block_stop", {"index": idx})
