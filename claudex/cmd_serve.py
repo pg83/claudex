@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import httpx
+import signal
 import uvicorn
 import argparse
 
@@ -56,6 +57,9 @@ class ProxyServer:
 
     @asynccontextmanager
     async def lifespan(self, app: Starlette):
+        signal.signal(signal.SIGINT, lambda *_: os._exit(130))
+        signal.signal(signal.SIGTERM, lambda *_: os._exit(130))
+
         yield
 
         for c in self.clients.values():
