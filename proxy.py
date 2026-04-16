@@ -377,6 +377,67 @@ def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     return _TOOL_CHOICE_MAP.get(tc_type, "auto")
 
 
+def _convert_user_msg(content) -> list[dict]:
+    """Convert Anthropic user message content to OpenAI messages.
+
+    May return multiple messages: tool results become separate "tool" messages,
+    remaining content becomes a "user" message.
+    """
+    if isinstance(content, list):
+        tool_results = [b for b in content if b.get("type") == "tool_result"]
+        other_blocks = [b for b in content if b.get("type") != "tool_result"]
+    else:
+        tool_results = []
+        other_blocks = content
+
+    result = []
+    for tr in tool_results:
+        result.append({
+            "role": "tool",
+            "tool_call_id": to_openai_tool_id(tr["tool_use_id"]),
+            "content": extract_tool_result_content(tr),
+        })
+
+    if other_blocks:
+        converted = convert_content_to_openai(other_blocks)
+        if converted:
+            result.append({"role": "user", "content": converted})
+
+    return result
+
+
+def _convert_assistant_msg(content) -> dict:
+    """Convert Anthropic assistant message content to a single OpenAI message."""
+    if isinstance(content, str):
+        return {"role": "assistant", "content": content}
+
+    if isinstance(content, list):
+        text_parts = []
+        tool_calls = []
+        for block in content:
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block["text"])
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": to_openai_tool_id(block["id"]),
+                    "type": "function",
+                    "function": {
+                        "name": block["name"],
+                        "arguments": json.dumps(block.get("input", {})),
+                    },
+                })
+
+        assistant_msg: dict = {"role": "assistant"}
+        text = "\n".join(text_parts) if text_parts else None
+        assistant_msg["content"] = text
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        return assistant_msg
+
+    return {"role": "assistant", "content": str(content)}
+
+
 def convert_request(body: dict, openai_model: str) -> dict:
     """Translate an Anthropic Messages API request to OpenAI Chat Completions."""
     thinking = body.get("thinking")
@@ -393,53 +454,9 @@ def convert_request(body: dict, openai_model: str) -> dict:
         content = msg.get("content", "")
 
         if role == "user":
-            if isinstance(content, list):
-                tool_results = [b for b in content if b.get("type") == "tool_result"]
-                other_blocks = [b for b in content if b.get("type") != "tool_result"]
-            else:
-                tool_results = []
-                other_blocks = content
-
-            for tr in tool_results:
-                openai_messages.append({
-                    "role": "tool",
-                    "tool_call_id": to_openai_tool_id(tr["tool_use_id"]),
-                    "content": extract_tool_result_content(tr),
-                })
-
-            if other_blocks:
-                converted = convert_content_to_openai(other_blocks)
-                if converted:
-                    openai_messages.append({"role": "user", "content": converted})
-
+            openai_messages.extend(_convert_user_msg(content))
         elif role == "assistant":
-            if isinstance(content, str):
-                openai_messages.append({"role": "assistant", "content": content})
-            elif isinstance(content, list):
-                text_parts = []
-                tool_calls = []
-                for block in content:
-                    btype = block.get("type")
-                    if btype == "text":
-                        text_parts.append(block["text"])
-                    elif btype == "tool_use":
-                        tool_calls.append({
-                            "id": to_openai_tool_id(block["id"]),
-                            "type": "function",
-                            "function": {
-                                "name": block["name"],
-                                "arguments": json.dumps(block.get("input", {})),
-                            },
-                        })
-
-                assistant_msg: dict = {"role": "assistant"}
-                text = "\n".join(text_parts) if text_parts else None
-                assistant_msg["content"] = text
-                if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
-                openai_messages.append(assistant_msg)
-            else:
-                openai_messages.append({"role": "assistant", "content": str(content)})
+            openai_messages.append(_convert_assistant_msg(content))
 
     openai_body: dict = {
         "model": openai_model,
@@ -1065,6 +1082,90 @@ async def compress_context(messages: list, req_id: str = "") -> list:
 
 
 # ---------------------------------------------------------------------------
+# Proxy tool loop
+# ---------------------------------------------------------------------------
+
+
+async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str) -> dict:
+    """Call OpenAI, execute proxy-handled tools in a loop, return final response."""
+    for _tool_iter in range(6):  # max 5 tool round-trips + 1 final
+        debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
+                  model=openai_body.get("model", ""),
+                  base_url=ep["base_url"],
+                  messages=len(openai_body.get("messages", [])))
+
+        openai_resp = await call_openai(openai_body, stream=False,
+                                        base_url=ep["base_url"], api_key=ep["api_key"])
+        debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
+                  finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
+
+        proxy_tools = _extract_proxy_tool_calls(openai_resp)
+        if not proxy_tools:
+            break
+
+        # Model called proxy-handled tools — execute them and resend
+        assistant_msg = openai_resp["choices"][0]["message"]
+        openai_body["messages"].append(assistant_msg)
+
+        for tc in proxy_tools:
+            fn = tc["function"]
+            tool_name = fn["name"]
+            try:
+                tool_input = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                tool_input = {}
+            try:
+                result = await execute_proxy_tool(tool_name, tool_input, req_id=req_id)
+            except Exception as e:
+                result = f"Error: {e}"
+                log(f"tool error {tool_name}: {e}", req_id=req_id)
+            openai_body["messages"].append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+    return openai_resp
+
+
+# ---------------------------------------------------------------------------
+# RAG enrichment
+# ---------------------------------------------------------------------------
+
+
+def _enrich_with_rag(body: dict, req_id: str):
+    """Index conversation messages and inject RAG context into last user message."""
+    for msg in body.get("messages", []):
+        text = _extract_msg_text(msg)
+        if text:
+            rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, CONFIG.get("rag_chunk_size", 2000))
+    last_text = _extract_last_user_text(body.get("messages", []))
+    if not last_text:
+        return
+    rag_results = rag_instance.search(last_text, CONFIG.get("rag_max_results", 3))
+    if not rag_results:
+        return
+    rag_block = "\n".join(
+        f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
+        for r in rag_results
+    )
+    # Append RAG context to the last user message
+    messages = body.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+            if isinstance(content, str):
+                msg["content"] = content + suffix
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": suffix})
+            break
+    hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
+    log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
+    debug_log("RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -1100,32 +1201,7 @@ async def create_message(request: Request):
 
     # RAG: index incoming messages, then search
     if rag_instance is not None:
-        for msg in body.get("messages", []):
-            text = _extract_msg_text(msg)
-            if text:
-                rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, CONFIG.get("rag_chunk_size", 2000))
-        last_text = _extract_last_user_text(body.get("messages", []))
-        if last_text:
-            rag_results = rag_instance.search(last_text, CONFIG.get("rag_max_results", 3))
-            if rag_results:
-                rag_block = "\n".join(
-                    f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
-                    for r in rag_results
-                )
-                # Append RAG context to the last user message
-                messages = body.get("messages", [])
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
-                        if isinstance(content, str):
-                            msg["content"] = content + suffix
-                        elif isinstance(content, list):
-                            content.append({"type": "text", "text": suffix})
-                        break
-                hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
-                log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
-                debug_log("RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+        _enrich_with_rag(body, req_id)
 
     try:
         openai_body = convert_request(body, ep["model"])
@@ -1138,43 +1214,7 @@ async def create_message(request: Request):
     openai_body.pop("stream_options", None)
 
     try:
-        for _tool_iter in range(6):  # max 5 tool round-trips + 1 final
-            debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
-                      model=openai_body.get("model", ""),
-                      base_url=ep["base_url"],
-                      messages=len(openai_body.get("messages", [])))
-
-            openai_resp = await call_openai(openai_body, stream=False,
-                                            base_url=ep["base_url"], api_key=ep["api_key"])
-            debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
-                      finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
-
-            proxy_tools = _extract_proxy_tool_calls(openai_resp)
-            if not proxy_tools:
-                break
-
-            # Model called proxy-handled tools — execute them and resend
-            assistant_msg = openai_resp["choices"][0]["message"]
-            openai_body["messages"].append(assistant_msg)
-
-            for tc in proxy_tools:
-                fn = tc["function"]
-                tool_name = fn["name"]
-                try:
-                    tool_input = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    tool_input = {}
-                try:
-                    result = await execute_proxy_tool(tool_name, tool_input, req_id=req_id)
-                except Exception as e:
-                    result = f"Error: {e}"
-                    log(f"tool error {tool_name}: {e}", req_id=req_id)
-                openai_body["messages"].append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
-
+        openai_resp = await _proxy_tool_loop(openai_body, ep, req_id)
         anthropic_resp = convert_response(openai_resp, anthropic_model)
 
         if is_stream:
