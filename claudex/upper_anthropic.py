@@ -22,10 +22,10 @@ class AnthropicUpper:
         self.server = server
         self.ep = ep
 
-    async def _send(self, body: dict, headers: dict, stream: bool) -> httpx.Response:
+    async def _send(self, body: dict, client_headers, stream: bool) -> httpx.Response:
         url = self.ep["base_url"].rstrip("/") + "/messages"
         http = self.server.client(self.ep.get("proxy"))
-        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=headers)
+        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=upstream_headers(client_headers, self.ep))
         resp = await http.send(req, stream=stream)
 
         if resp.status_code != 200:
@@ -37,13 +37,13 @@ class AnthropicUpper:
 
         return resp
 
-    async def call(self, body: dict, headers: dict, req_id: str) -> dict:
-        resp = await self._send(body, headers, stream=False)
+    async def call(self, body: dict, client_headers, req_id: str) -> dict:
+        resp = await self._send(body, client_headers, stream=False)
 
         return resp.json()
 
-    async def stream(self, body: dict, headers: dict, req_id: str) -> AsyncIterator[str]:
-        resp = await self._send(body, headers, stream=True)
+    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
+        resp = await self._send(body, client_headers, stream=True)
 
         return _iter_chunks(resp)
 

@@ -512,7 +512,8 @@ class OpenAIUpper:
         self.server = server
         self.ep = ep
 
-    async def _post(self, openai_body: dict, headers: dict, stream: bool) -> Union[httpx.Response, dict]:
+    async def _post(self, openai_body: dict, client_headers, stream: bool) -> Union[httpx.Response, dict]:
+        headers = upstream_headers(client_headers, self.ep)
         url = chat_url(self.ep["base_url"])
         http = self.server.client(self.ep.get("proxy"))
 
@@ -542,20 +543,20 @@ class OpenAIUpper:
 
         return data
 
-    async def call(self, body: dict, headers: dict, req_id: str) -> dict:
+    async def call(self, body: dict, client_headers, req_id: str) -> dict:
         openai_body = convert_request(body, body["model"])
         openai_body["stream"] = False
         openai_body.pop("stream_options", None)
 
-        openai_resp = await self._post(openai_body, headers, stream=False)
+        openai_resp = await self._post(openai_body, client_headers, stream=False)
 
         return convert_response(openai_resp, body["model"])
 
-    async def stream(self, body: dict, headers: dict, req_id: str) -> AsyncIterator[str]:
+    async def stream(self, body: dict, client_headers, req_id: str) -> AsyncIterator[str]:
         openai_body = convert_request(body, body["model"])
         openai_body["stream"] = True
         openai_body["stream_options"] = {"include_usage": True}
 
-        resp = await self._post(openai_body, headers, stream=True)
+        resp = await self._post(openai_body, client_headers, stream=True)
 
         return stream_translate(resp, body["model"], self.server.config, req_id=req_id)

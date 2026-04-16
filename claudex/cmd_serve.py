@@ -230,13 +230,11 @@ class ProxyServer:
 
         if ep.get("protocol") == "anthropic":
             upper = ua.AnthropicUpper(self, ep)
-            upstream_headers = ua.upstream_headers(request.headers, ep)
         else:
             upper = uo.OpenAIUpper(self, ep)
-            upstream_headers = uo.upstream_headers(request.headers, ep)
 
         try:
-            return await self._lower_handle(upper, body, upstream_headers, anthropic_model, req_id, is_stream)
+            return await self._lower_handle(upper, body, anthropic_model, req_id, request.headers, is_stream)
         except httpx.HTTPStatusError as e:
             try:
                 error_body = e.response.json()
@@ -254,12 +252,12 @@ class ProxyServer:
 
             return pc.error_response(500, "api_error", str(e))
 
-    async def _lower_handle(self, upper, body: dict, headers: dict, anthropic_model: str, req_id: str, is_stream: bool):
+    async def _lower_handle(self, upper, body: dict, anthropic_model: str, req_id: str, client_headers, is_stream: bool):
         proto = type(upper).__name__
 
         if is_stream:
             lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, stream=True, proto=proto)
-            iterator = await upper.stream(body, headers, req_id)
+            iterator = await upper.stream(body, client_headers, req_id)
 
             return StreamingResponse(
                 pc.debug_stream_wrap(iterator, self.config, req_id),
@@ -272,7 +270,7 @@ class ProxyServer:
         for _ in range(6):
             lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, proto=proto,
                       messages=len(body.get("messages", [])))
-            resp = await upper.call(body, headers, req_id)
+            resp = await upper.call(body, client_headers, req_id)
             lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, proto=proto,
                       stop=resp.get("stop_reason"))
 
