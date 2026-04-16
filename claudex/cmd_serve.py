@@ -179,10 +179,11 @@ class ProxyServer:
         )
         messages = body.get("messages", [])
 
+        suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = msg.get("content", "")
-                suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
 
                 if isinstance(content, str):
                     msg["content"] = content + suffix
@@ -191,14 +192,7 @@ class ProxyServer:
 
                 break
 
-        q_preview = last_text[:200].replace("\n", " ")
-        lg.log(f"rag query: {q_preview!r}", sid=sid)
-
-        for r in rag_results:
-            data_preview = r["data"][:200].replace("\n", " ")
-            paths = ", ".join(r["paths"])
-            lg.log(f"rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", sid=sid)
-
+        lg.log(suffix, sid=sid)
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
     # ----- HTTP endpoints -----
