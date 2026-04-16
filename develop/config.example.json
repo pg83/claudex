@@ -23,7 +23,6 @@
       {
         "type": "whoosh",
         "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-        "chunk_size": 2000,
         "max_results": 5
       }
     ],
@@ -39,7 +38,6 @@
       },
       {
         "type": "whoosh",
-        "chunk_size": 500,
         "max_results": 2
       }
     ]

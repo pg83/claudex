@@ -41,7 +41,7 @@ def cmd_search(args: argparse.Namespace):
             src_c = SOURCE_COLORS.get(h["source"], "")
             eng_c = ENGINE_COLORS.get(h["engine"], "")
             paths = ", ".join(f"{src_c}{p}{RESET}" for p in h["paths"])
-            print(f"{DIM}[{h['rank']:.3f}]{RESET} {eng_c}{h['engine']}{RESET} {paths}")
+            print(f"{DIM}[rrf={h['rank']:.4f} raw={h['raw_score']:.3f}]{RESET} {eng_c}{h['engine']}{RESET} {paths}")
             print(h["data"])
             print(f"{DIM}---{RESET}")
 

@@ -223,64 +223,62 @@ class WhooshEngine:
         from whoosh.fields import Schema, TEXT, ID
         from whoosh.filedb.filestore import RamStorage
 
-        self.chunk_size = cfg.get("chunk_size", 2000)
         self.max_results = cfg.get("max_results", 5)
+        self.snippet_chars = cfg.get("snippet_chars", 300)
 
         self._schema = Schema(
-            path=ID(stored=True),
+            path=ID(stored=True, unique=True),
             body=TEXT(stored=True),
         )
         self._ix = RamStorage().create_index(self._schema)
-        self._seen: set[str] = set()
 
         writer = self._ix.writer()
+        n = 0
 
         for path, text in walk_files(cfg):
-            added = self._index(writer, path, text)
-            print(f"  whoosh: {path} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
+            if not text.strip():
+                continue
+
+            writer.update_document(path=path, body=text)
+            n += 1
+            print(f"  whoosh: {path} ({len(text)} chars)", file=sys.stderr, flush=True)
 
         writer.commit()
-
-    def _index(self, writer, path: str, text: str) -> int:
-        added = 0
-
-        for chunk in split_text(text, self.chunk_size):
-            if not chunk.strip():
-                continue
-
-            sha = hashlib.sha256((path + "\0" + chunk).encode()).hexdigest()
-
-            if sha in self._seen:
-                continue
-
-            self._seen.add(sha)
-            writer.add_document(path=path, body=chunk)
-            added += 1
-
-        return added
+        self._doc_count = n
 
     def add(self, path: str, text: str) -> int:
-        writer = self._ix.writer()
-        added = self._index(writer, path, text)
-        writer.commit()
+        if not text.strip():
+            return 0
 
-        return added
+        writer = self._ix.writer()
+        writer.update_document(path=path, body=text)
+        writer.commit()
+        self._doc_count += 1
+
+        return 1
 
     def search(self, query: str) -> list[dict]:
         from whoosh.qparser import QueryParser
+        from whoosh.highlight import ContextFragmenter, UppercaseFormatter
 
         with self._ix.searcher() as s:
             q = QueryParser("body", self._schema).parse(query)
             hits = s.search(q, limit=self.max_results)
+            hits.fragmenter = ContextFragmenter(maxchars=self.snippet_chars, surround=self.snippet_chars // 4)
+            hits.formatter = UppercaseFormatter()
 
             return [
-                {"paths": [h["path"]], "data": h["body"], "rank": h.score}
+                {
+                    "paths": [h["path"]],
+                    "data": h.highlights("body") or h["body"][:self.snippet_chars],
+                    "rank": h.score,
+                }
                 for h in hits
             ]
 
     @property
     def size(self) -> int:
-        return len(self._seen)
+        return self._doc_count
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +316,20 @@ class Search:
             engine.add(path, text)
 
     def search(self, query: str, limit: int = None) -> list[dict]:
+        k = 60
         hits = []
 
         for source, engines in self.engines_by_source.items():
             for engine in engines:
-                for h in engine.search(query):
-                    hits.append({**h, "source": source, "engine": engine.type_name})
+                for pos, h in enumerate(engine.search(query)):
+                    hits.append({
+                        "paths": h["paths"],
+                        "data": h["data"],
+                        "source": source,
+                        "engine": engine.type_name,
+                        "raw_score": h["rank"],
+                        "rank": 1.0 / (k + pos + 1),
+                    })
 
         hits.sort(key=lambda r: -r["rank"])
 
