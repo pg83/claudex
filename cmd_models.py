@@ -5,7 +5,7 @@ import sys
 
 import httpx
 
-from common import ENDPOINTS, _expand_env, _strip_chat_suffix, load_config
+from common import _expand_env, _strip_chat_suffix, load_config
 
 
 def cmd_models(args: argparse.Namespace):
@@ -13,10 +13,11 @@ def cmd_models(args: argparse.Namespace):
         base_url = args.base_url
         api_key = _expand_env(args.api_key or "")
     elif args.config:
-        load_config(args.config)
-        if not ENDPOINTS:
+        config = load_config(args.config)
+        endpoints = config.get("endpoints", {})
+        if not endpoints:
             sys.exit("No endpoints configured")
-        ep = next(iter(ENDPOINTS.values()))
+        ep = next(iter(endpoints.values()))
         base_url = ep["base_url"]
         api_key = _expand_env(args.api_key) if args.api_key else ep["api_key"]
     else:

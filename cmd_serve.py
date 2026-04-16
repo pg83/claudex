@@ -1,10 +1,4 @@
-"""serve subcommand: FastAPI proxy server.
-
-Accepts Anthropic Messages API requests and either translates them to
-OpenAI Chat Completions or forwards them natively to an Anthropic-style
-upstream. Applies RAG enrichment, context compression, and in-proxy
-handling for WebFetch/WebSearch tools.
-"""
+"""serve subcommand: FastAPI proxy server."""
 
 import argparse
 import json
@@ -20,13 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from common import (
-    CONFIG,
-    ENDPOINTS,
-    _strip_chat_suffix,
-    load_config,
-    resolve_endpoint,
-)
+from common import _strip_chat_suffix, load_config, resolve_endpoint
 from rag import RAG
 
 
@@ -152,8 +140,8 @@ def _human_bytes(n: int) -> str:
     return f"{n/1024/1024:.1f}MB"
 
 
-def debug_log(event: str, data=None, req_id: str = "", **extra):
-    if not CONFIG["debug"]:
+def debug_log(config: dict, event: str, data=None, req_id: str = "", **extra):
+    if not config.get("debug"):
         return
     record = {"ts": time.strftime("%H:%M:%S"), "event": event}
     if req_id:
@@ -164,8 +152,8 @@ def debug_log(event: str, data=None, req_id: str = "", **extra):
     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def debug_sse(direction: str, event_str: str, req_id: str = ""):
-    if not CONFIG["debug"]:
+def debug_sse(config: dict, direction: str, event_str: str, req_id: str = ""):
+    if not config.get("debug"):
         return
     lines = event_str.strip().split("\n")
     etype = ""
@@ -542,6 +530,7 @@ def open_block_events(state: StreamState, block_type: str, content_block: dict) 
 async def stream_translate(
     openai_response: httpx.Response,
     anthropic_model: str,
+    config: dict,
     req_id: str = "",
 ) -> AsyncIterator[str]:
     state = StreamState(anthropic_model)
@@ -568,12 +557,12 @@ async def stream_translate(
     try:
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
-                debug_sse("in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
+                debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
                 break
 
             _chunk_count += 1
             _raw_chunks.append(chunk)
-            debug_sse("in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
+            debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
             if choices:
@@ -647,7 +636,7 @@ async def stream_translate(
 
     log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
         req_id=req_id)
-    debug_log("OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
+    debug_log(config, "OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
               chunks=_chunk_count,
               stop=stop_reason,
               input_tokens=state.input_tokens,
@@ -691,7 +680,6 @@ async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: s
 
 
 async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> AsyncIterator[str]:
-    """Emit Anthropic SSE events from a completed sync response."""
     yield sse_event("message_start", {"message": {
         "id": anthropic_resp.get("id", gen_message_id()),
         "type": "message",
@@ -747,9 +735,9 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
         req_id=req_id)
 
 
-async def _debug_stream_wrap(gen: AsyncIterator[str], req_id: str) -> AsyncIterator[str]:
+async def _debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) -> AsyncIterator[str]:
     async for event_str in gen:
-        debug_sse("out", event_str, req_id=req_id)
+        debug_sse(config, "out", event_str, req_id=req_id)
         yield event_str
 
 
@@ -765,13 +753,13 @@ _FETCH_HEADERS = {
 }
 
 
-async def execute_proxy_tool(name: str, tool_input: dict, req_id: str = "") -> str:
+async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: str = "") -> str:
     if name == "WebFetch":
         url = tool_input.get("url", "")
         log(f"web_fetch {url}", req_id=req_id)
         resp = await http_client.get(url, headers=_FETCH_HEADERS, timeout=15, follow_redirects=True)
         result = resp.text
-        debug_log("TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
         return result
 
     if name in ("WebSearch", "web_search"):
@@ -785,7 +773,7 @@ async def execute_proxy_tool(name: str, tool_input: dict, req_id: str = "") -> s
             follow_redirects=True,
         )
         result = resp.text
-        debug_log("TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
         return result
 
     return f"Unknown tool: {name}"
@@ -839,10 +827,10 @@ def _build_compress_body(messages: list, model: str) -> dict:
     }
 
 
-async def call_compress_llm(messages: list, req_id: str = "") -> str:
-    ep = resolve_endpoint("compress")
+async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> str:
+    ep = resolve_endpoint(config, "compress")
     compress_body = _build_compress_body(messages, ep["model"])
-    debug_log("COMPRESS_REQ", compress_body, req_id=req_id)
+    debug_log(config, "COMPRESS_REQ", compress_body, req_id=req_id)
 
     headers = {
         "Authorization": f"Bearer {ep['api_key']}",
@@ -856,7 +844,7 @@ async def call_compress_llm(messages: list, req_id: str = "") -> str:
     if "response" in data and "choices" not in data:
         data = data["response"]
 
-    debug_log("COMPRESS_RESP", data, req_id=req_id)
+    debug_log(config, "COMPRESS_RESP", data, req_id=req_id)
 
     return data["choices"][0]["message"]["content"] or ""
 
@@ -902,9 +890,9 @@ def _collapse_messages(messages: list) -> list:
     return result
 
 
-async def compress_context(messages: list, req_id: str = "") -> list:
-    keep = CONFIG["compress_keep"]
-    min_msgs = CONFIG["compress_min"]
+async def compress_context(config: dict, messages: list, req_id: str = "") -> list:
+    keep = config["compress_keep"]
+    min_msgs = config["compress_min"]
 
     if len(messages) < min_msgs:
         return messages
@@ -924,7 +912,7 @@ async def compress_context(messages: list, req_id: str = "") -> list:
     ratio = original_total / compressed_bytes if compressed_bytes else 0
     log(f"compress {len(messages)}→{len(compressed)} msgs, {_human_bytes(original_total)}→{_human_bytes(compressed_bytes)}, {ratio:.1f}x",
         req_id=req_id)
-    debug_log("CONTEXT COMPRESSION", compressed, req_id=req_id,
+    debug_log(config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
               original_msgs=len(messages),
               compressed_to=len(compressed),
               kept_verbatim=len(tail),
@@ -939,9 +927,9 @@ async def compress_context(messages: list, req_id: str = "") -> list:
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
+async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
     for _tool_iter in range(6):
-        debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
+        debug_log(config, "OPENAI REQUEST", openai_body, req_id=req_id,
                   model=openai_body.get("model", ""),
                   base_url=ep["base_url"],
                   messages=len(openai_body.get("messages", [])))
@@ -949,7 +937,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str, client_head
         openai_resp = await call_openai(openai_body, stream=False,
                                         base_url=ep["base_url"], api_key=ep["api_key"],
                                         client_headers=client_headers)
-        debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
+        debug_log(config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
                   finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
 
         proxy_tools = _extract_proxy_tool_calls(openai_resp)
@@ -967,7 +955,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str, client_head
             except json.JSONDecodeError:
                 tool_input = {}
             try:
-                result = await execute_proxy_tool(tool_name, tool_input, req_id=req_id)
+                result = await execute_proxy_tool(config, tool_name, tool_input, req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
                 log(f"tool error {tool_name}: {e}", req_id=req_id)
@@ -1021,16 +1009,16 @@ def _extract_proxy_tool_uses(anthropic_resp: dict) -> list:
     ]
 
 
-async def _proxy_tool_loop_anthropic(body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
+async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
     resp: dict = {}
     for _ in range(6):
-        debug_log("ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
+        debug_log(config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
                   model=body.get("model", ""),
                   base_url=ep["base_url"],
                   messages=len(body.get("messages", [])))
         resp = await call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
                                     client_headers=client_headers)
-        debug_log("ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
+        debug_log(config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
                   stop=resp.get("stop_reason"))
 
         proxy_uses = _extract_proxy_tool_uses(resp)
@@ -1042,7 +1030,7 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, req_id: str, client_h
         tool_results = []
         for tu in proxy_uses:
             try:
-                result = await execute_proxy_tool(tu["name"], tu.get("input", {}), req_id=req_id)
+                result = await execute_proxy_tool(config, tu["name"], tu.get("input", {}), req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
                 log(f"tool error {tu['name']}: {e}", req_id=req_id)
@@ -1061,15 +1049,16 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, req_id: str, client_h
 # ---------------------------------------------------------------------------
 
 
-def _enrich_with_rag(body: dict, req_id: str):
+def _enrich_with_rag(body: dict, config: dict, req_id: str):
+    chunk_size = config.get("rag_chunk_size", 2000)
     for msg in body.get("messages", []):
         text = _extract_msg_text(msg)
         if text:
-            rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, CONFIG.get("rag_chunk_size", 2000))
+            rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, chunk_size)
     last_text = _extract_last_user_text(body.get("messages", []))
     if not last_text:
         return
-    rag_results = rag_instance.search(last_text, CONFIG.get("rag_max_results", 3))
+    rag_results = rag_instance.search(last_text, config.get("rag_max_results", 3))
     if not rag_results:
         return
     rag_block = "\n".join(
@@ -1088,7 +1077,7 @@ def _enrich_with_rag(body: dict, req_id: str):
             break
     hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
     log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
-    debug_log("RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+    debug_log(config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1098,6 +1087,7 @@ def _enrich_with_rag(body: dict, req_id: str):
 
 @app.post("/v1/messages")
 async def create_message(request: Request):
+    config = request.app.state.config
     req_id = _next_req_id()
 
     try:
@@ -1107,7 +1097,7 @@ async def create_message(request: Request):
 
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
-    ep = resolve_endpoint(anthropic_model)
+    ep = resolve_endpoint(config, anthropic_model)
     n_msgs = len(body.get("messages", []))
     n_tools = len(body.get("tools", []))
     body_bytes = len(json.dumps(body))
@@ -1116,16 +1106,16 @@ async def create_message(request: Request):
     log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {_human_bytes(body_bytes)}, {stream_tag}",
         req_id=req_id)
 
-    debug_log("ANTHROPIC REQUEST", body, req_id=req_id,
+    debug_log(config, "ANTHROPIC REQUEST", body, req_id=req_id,
               model=anthropic_model, stream=is_stream,
               endpoint_model=ep["model"],
               messages=n_msgs, tools=n_tools)
 
-    if "compress" in ENDPOINTS and "messages" in body:
-        body["messages"] = await compress_context(body["messages"], req_id=req_id)
+    if "compress" in config["endpoints"] and "messages" in body:
+        body["messages"] = await compress_context(config, body["messages"], req_id=req_id)
 
     if rag_instance is not None:
-        _enrich_with_rag(body, req_id)
+        _enrich_with_rag(body, config, req_id)
 
     try:
         if ep.get("protocol") == "anthropic":
@@ -1134,22 +1124,23 @@ async def create_message(request: Request):
             upstream_body["model"] = ep["model"]
             upstream_body["stream"] = False
             anthropic_resp = await _proxy_tool_loop_anthropic(
-                upstream_body, ep, req_id, client_headers=request.headers,
+                upstream_body, ep, config, req_id, client_headers=request.headers,
             )
             anthropic_resp["model"] = anthropic_model
         else:
             openai_body = convert_request(body, ep["model"])
             openai_body["stream"] = False
             openai_body.pop("stream_options", None)
-            openai_resp = await _proxy_tool_loop(openai_body, ep, req_id, client_headers=request.headers)
+            openai_resp = await _proxy_tool_loop(openai_body, ep, config, req_id, client_headers=request.headers)
             anthropic_resp = convert_response(openai_resp, anthropic_model)
 
         if is_stream:
-            debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+            debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
                       stop=anthropic_resp.get("stop_reason"))
             return StreamingResponse(
                 _debug_stream_wrap(
                     fake_stream_from_response(anthropic_resp, req_id=req_id),
+                    config,
                     req_id,
                 ),
                 media_type="text/event-stream",
@@ -1159,7 +1150,7 @@ async def create_message(request: Request):
             usage = anthropic_resp.get("usage", {})
             log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
                 req_id=req_id)
-            debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+            debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
                       stop=anthropic_resp.get("stop_reason"))
             return JSONResponse(content=anthropic_resp)
 
@@ -1169,11 +1160,11 @@ async def create_message(request: Request):
         except Exception:
             error_body = None
         log(f"ERROR {e.response.status_code}", req_id=req_id)
-        debug_log("OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
+        debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
         return translate_openai_error(e.response.status_code, error_body)
     except Exception as e:
         log(f"ERROR {e}", req_id=req_id)
-        debug_log("PROXY ERROR", {"error": str(e)}, req_id=req_id)
+        debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
         return error_response(500, "api_error", str(e))
 
 
@@ -1220,8 +1211,10 @@ async def count_tokens(request: Request):
 
 
 @app.get("/v1/models")
-async def list_models():
-    models = [f"claude-{role}" for role in ENDPOINTS if role != "compress"] or [
+async def list_models(request: Request):
+    config = request.app.state.config
+    endpoints = config.get("endpoints", {})
+    models = [f"claude-{role}" for role in endpoints if role != "compress"] or [
         "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
     ]
     return JSONResponse(content={
@@ -1241,33 +1234,36 @@ async def list_models():
 def cmd_serve(args: argparse.Namespace):
     global rag_instance
 
-    load_config(args.config)
+    config = load_config(args.config)
     if args.debug:
-        CONFIG["debug"] = True
+        config["debug"] = True
     if args.port:
-        CONFIG["port"] = args.port
+        config["port"] = args.port
 
-    host = CONFIG.get("host", "127.0.0.1")
-    port = CONFIG.get("port", 8082)
+    app.state.config = config
+
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 8082)
+    endpoints = config.get("endpoints", {})
 
     def info(msg): print(msg, file=sys.stderr, flush=True)
 
     info(f"Proxy starting on {host}:{port}")
     info("Endpoints:")
-    for role, ep in ENDPOINTS.items():
+    for role, ep in endpoints.items():
         info(f"  {role} [{ep['protocol']}]: {ep['base_url']} -> {ep['model']}")
-    if "compress" in ENDPOINTS:
-        info(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
+    if "compress" in endpoints:
+        info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
 
-    rag_dirs = CONFIG.get("rag_dirs", [])
+    rag_dirs = config.get("rag_dirs", [])
     if rag_dirs:
-        exts = CONFIG.get("rag_extensions")
-        chunk_size = CONFIG.get("rag_chunk_size", 2000)
+        exts = config.get("rag_extensions")
+        chunk_size = config.get("rag_chunk_size", 2000)
         dirs = [os.path.expanduser(d) for d in rag_dirs]
         rag_instance = RAG(dirs, set(exts) if exts else None, chunk_size)
         info(f"RAG: {rag_instance.n_files} files, {rag_instance.n_chunks} chunks from {', '.join(dirs)}")
 
-    if CONFIG["debug"]:
+    if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
     info("")
     info("Usage:")
