@@ -174,35 +174,17 @@ class ProxyServer:
             return
 
         block = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
-        messages = body.get("messages", [])
-
-        suffix = f"\n---\n<cx:search>\n{block}\n</cx:search>"
-
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-
-                if isinstance(content, str):
-                    msg["content"] = content + suffix
-                elif isinstance(content, list):
-                    content.append({"type": "text", "text": suffix})
-
-                break
-
-        note = (
-            "Tag <cx:search> marks fuzzy-search results from your persistent "
-            "associative memory; consider them when answering."
-        )
+        wrapped = f"<cx:search>\n{block}\n</cx:search>"
         system = body.get("system")
 
         if isinstance(system, str):
-            body["system"] = (note + "\n\n" + system) if system else note
+            body["system"] = (wrapped + "\n\n" + system) if system else wrapped
         elif isinstance(system, list):
-            system.insert(0, {"type": "text", "text": note})
+            system.insert(0, {"type": "text", "text": wrapped})
         else:
-            body["system"] = note
+            body["system"] = wrapped
 
-        lg.log(suffix, sid=sid)
+        lg.log(wrapped, sid=sid)
         lg.debug_log(self.config, "SEARCH", {"query": last_text, "results": hits}, req_id=req_id)
 
     # ----- HTTP endpoints -----
