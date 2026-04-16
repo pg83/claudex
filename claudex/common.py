@@ -51,6 +51,7 @@ def load_config(path: str) -> dict:
     }
 
     listen = cfg.get("listen", "127.0.0.1:8082")
+
     if ":" in listen:
         host, port = listen.rsplit(":", 1)
         config["host"] = host
@@ -60,17 +61,20 @@ def load_config(path: str) -> dict:
         config["port"] = int(listen)
 
     raw = cfg.get("rag_dir")
+
     if isinstance(raw, str):
         config["rag_dirs"] = [raw]
     elif isinstance(raw, list):
         config["rag_dirs"] = raw
     else:
         config["rag_dirs"] = []
+
     config["rag_extensions"] = cfg.get("rag_extensions")
     config["rag_max_results"] = cfg.get("rag_max_results", 3)
     config["rag_chunk_size"] = cfg.get("rag_chunk_size", 2000)
 
     endpoints: dict = {}
+
     for role, ep in cfg.get("endpoints", {}).items():
         base_url = _expand_env(ep.get("base_url", ""))
         endpoints[role] = {
@@ -80,6 +84,7 @@ def load_config(path: str) -> dict:
             "ssl_verify": ep.get("ssl_verify", False),
             "protocol": ep.get("protocol") or _infer_protocol(base_url),
         }
+
     config["endpoints"] = endpoints
 
     return config
@@ -91,11 +96,13 @@ def resolve_endpoint(config: dict, name: str) -> dict:
     Fallback chain (hardcoded): compress -> haiku -> sonnet -> opus.
     """
     endpoints = config.get("endpoints", {})
+
     if name in endpoints:
         return endpoints[name]
 
     role = None
     name_lower = name.lower()
+
     if "opus" in name_lower:
         role = "opus"
     elif "haiku" in name_lower:
@@ -105,14 +112,18 @@ def resolve_endpoint(config: dict, name: str) -> dict:
 
     current = role
     visited = set()
+
     while current:
         if current in endpoints:
             return endpoints[current]
+
         if current in visited:
             break
+
         visited.add(current)
         current = FALLBACK_CHAIN.get(current)
 
     if endpoints:
         return next(iter(endpoints.values()))
+
     return {"base_url": "", "model": name, "api_key": "", "ssl_verify": False, "protocol": "openai"}

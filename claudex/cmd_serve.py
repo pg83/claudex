@@ -38,8 +38,10 @@ def _chat_url(base_url: str) -> str:
 
 def _messages_url(base_url: str) -> str:
     base = base_url.rstrip("/")
+
     if base.endswith("/messages"):
         return base
+
     return base + "/messages"
 
 
@@ -83,10 +85,12 @@ def to_openai_tool_id(anthropic_id: str) -> str:
 def extract_system_text(system) -> str:
     if isinstance(system, str):
         return system
+
     if isinstance(system, list):
         return "\n\n".join(
             block["text"] for block in system if block.get("type") == "text"
         )
+
     return str(system) if system else ""
 
 
@@ -103,9 +107,11 @@ def sse_event(event_type: str, data: dict) -> str:
 def _extract_text_content(content) -> str:
     if isinstance(content, str):
         return content
+
     if isinstance(content, list):
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
         return " ".join(texts)
+
     return ""
 
 
@@ -117,6 +123,7 @@ def _extract_last_user_text(messages: list) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "user":
             return _extract_text_content(msg.get("content", ""))
+
     return ""
 
 
@@ -130,12 +137,15 @@ def convert_content_to_openai(content):
         return content
 
     parts = []
+
     for block in content:
         btype = block.get("type")
+
         if btype == "text":
             parts.append({"type": "text", "text": block["text"]})
         elif btype == "image":
             source = block["source"]
+
             if source.get("type") == "base64":
                 url = f"data:{source['media_type']};base64,{source['data']}"
                 parts.append({"type": "image_url", "image_url": {"url": url}})
@@ -144,13 +154,16 @@ def convert_content_to_openai(content):
 
     if not parts:
         return ""
+
     if len(parts) == 1 and parts[0]["type"] == "text":
         return parts[0]["text"]
+
     return parts
 
 
 def extract_tool_result_content(block) -> str:
     content = block.get("content", "")
+
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -158,8 +171,10 @@ def extract_tool_result_content(block) -> str:
         text = "\n".join(texts)
     else:
         text = str(content)
+
     if block.get("is_error"):
         text = f"Error: {text}"
+
     return text
 
 
@@ -183,9 +198,12 @@ _TOOL_CHOICE_MAP = {"auto": "auto", "any": "required", "none": "none"}
 def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     if not isinstance(anthropic_tc, dict):
         return "auto"
+
     tc_type = anthropic_tc.get("type", "auto")
+
     if tc_type == "tool":
         return {"type": "function", "function": {"name": anthropic_tc["name"]}}
+
     return _TOOL_CHOICE_MAP.get(tc_type, "auto")
 
 
@@ -198,6 +216,7 @@ def _convert_user_msg(content) -> list[dict]:
         other_blocks = content
 
     result = []
+
     for tr in tool_results:
         result.append({
             "role": "tool",
@@ -207,6 +226,7 @@ def _convert_user_msg(content) -> list[dict]:
 
     if other_blocks:
         converted = convert_content_to_openai(other_blocks)
+
         if converted:
             result.append({"role": "user", "content": converted})
 
@@ -220,8 +240,10 @@ def _convert_assistant_msg(content) -> dict:
     if isinstance(content, list):
         text_parts = []
         tool_calls = []
+
         for block in content:
             btype = block.get("type")
+
             if btype == "text":
                 text_parts.append(block["text"])
             elif btype == "tool_use":
@@ -237,8 +259,10 @@ def _convert_assistant_msg(content) -> dict:
         assistant_msg: dict = {"role": "assistant"}
         text = "\n".join(text_parts) if text_parts else None
         assistant_msg["content"] = text
+
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
+
         return assistant_msg
 
     return {"role": "assistant", "content": str(content)}
@@ -251,6 +275,7 @@ def convert_request(body: dict, openai_model: str) -> dict:
     openai_messages: list[dict] = []
 
     system_text = extract_system_text(body.get("system"))
+
     if system_text:
         openai_messages.append({"role": "developer", "content": system_text})
 
@@ -270,6 +295,7 @@ def convert_request(body: dict, openai_model: str) -> dict:
     }
 
     max_tokens = body.get("max_tokens", 4096)
+
     if has_thinking:
         openai_body["max_completion_tokens"] = max_tokens
     else:
@@ -292,6 +318,7 @@ def convert_request(body: dict, openai_model: str) -> dict:
 
     if has_thinking:
         budget = thinking.get("budget_tokens", 0)
+
         if budget <= 2048:
             openai_body["reasoning_effort"] = "low"
         elif budget <= 8192:
@@ -339,6 +366,7 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
                 tool_input = json.loads(tc["function"]["arguments"])
             except (json.JSONDecodeError, KeyError):
                 tool_input = {}
+
             content_blocks.append({
                 "type": "tool_use",
                 "id": to_anthropic_tool_id(tc["id"]),
@@ -381,6 +409,7 @@ def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
 
 def translate_openai_error(status_code: int, openai_error: Optional[dict] = None) -> JSONResponse:
     error_msg = "Unknown error"
+
     if openai_error and "error" in openai_error:
         err = openai_error["error"]
         error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
@@ -407,10 +436,13 @@ def translate_openai_error(status_code: int, openai_error: Optional[dict] = None
 async def iter_openai_sse(response: httpx.Response) -> AsyncIterator[Union[dict, str]]:
     async for line in response.aiter_lines():
         line = line.strip()
+
         if not line or line.startswith(":"):
             continue
+
         if line.startswith("data: "):
             data = line[6:]
+
             if data.strip() == "[DONE]":
                 yield "[DONE]"
             else:
@@ -442,6 +474,7 @@ def close_block_events(state: StreamState) -> list[str]:
         return []
 
     events: list[str] = []
+
     if state.current_block_type == "thinking":
         events.append(sse_event("content_block_delta", {
             "index": state.block_index,
@@ -460,6 +493,7 @@ def close_block_events(state: StreamState) -> list[str]:
 def open_block_events(state: StreamState, block_type: str, content_block: dict) -> list[str]:
     if state.current_block_type == block_type:
         return []
+
     events = close_block_events(state)
     state.current_block_type = block_type
     events.append(sse_event("content_block_start", {
@@ -507,6 +541,7 @@ async def stream_translate(
             lg.debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
+
             if choices:
                 choice = choices[0]
                 delta = choice.get("delta", {})
@@ -515,6 +550,7 @@ async def stream_translate(
                     finish_reason = choice["finish_reason"]
 
                 reasoning = delta.get("reasoning_content")
+
                 if reasoning:
                     for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
                         yield ev
@@ -524,6 +560,7 @@ async def stream_translate(
                     })
 
                 text = delta.get("content")
+
                 if text:
                     for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
                         yield ev
@@ -533,6 +570,7 @@ async def stream_translate(
                     })
 
                 tc_deltas = delta.get("tool_calls")
+
                 if tc_deltas:
                     for tc_delta in tc_deltas:
                         tc_idx = tc_delta.get("index", 0)
@@ -559,6 +597,7 @@ async def stream_translate(
                             })
 
             usage = chunk.get("usage")
+
             if usage:
                 state.input_tokens = usage.get("prompt_tokens", state.input_tokens)
                 state.output_tokens = usage.get("completion_tokens", state.output_tokens)
@@ -592,17 +631,21 @@ async def stream_translate(
 
 async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None) -> Union[httpx.Response, dict]:
     headers = {"Content-Type": "application/json"}
+
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     elif client_headers:
         auth = client_headers.get("authorization")
+
         if auth:
             headers["Authorization"] = auth
+
     url = _chat_url(base_url)
 
     if stream:
         req = http_client.build_request("POST", url, json=openai_body, headers=headers)
         resp = await http_client.send(req, stream=True)
+
         if resp.status_code != 200:
             body = await resp.aread()
             await resp.aclose()
@@ -611,13 +654,17 @@ async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: s
                 request=req,
                 response=resp,
             )
+
         return resp
+
     else:
         resp = await http_client.post(url, json=openai_body, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+
         if "response" in data and "choices" not in data:
             data = data["response"]
+
         return data
 
 
@@ -636,6 +683,7 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
 
     for idx, block in enumerate(anthropic_resp.get("content", [])):
         btype = block.get("type", "text")
+
         if btype == "text":
             yield sse_event("content_block_start", {
                 "index": idx, "content_block": {"type": "text", "text": ""},
@@ -723,8 +771,10 @@ async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: 
 
 def _extract_proxy_tool_calls(openai_resp: dict) -> list:
     choices = openai_resp.get("choices", [])
+
     if not choices:
         return []
+
     msg = choices[0].get("message", {})
     tool_calls = msg.get("tool_calls") or []
     return [tc for tc in tool_calls if tc.get("function", {}).get("name") in PROXY_HANDLED_TOOLS]
@@ -810,6 +860,7 @@ def _collapse_messages(messages: list) -> list:
                     user_text.append(content)
             elif isinstance(content, list):
                 has_tool_result = any(b.get("type") == "tool_result" for b in content)
+
                 if has_tool_result:
                     flush_user_text()
                     result.append(msg)
@@ -820,11 +871,13 @@ def _collapse_messages(messages: list) -> list:
 
         elif role == "assistant":
             flush_user_text()
+
             if isinstance(content, str):
                 if content.strip():
                     result.append(msg)
             elif isinstance(content, list):
                 blocks = [b for b in content if b.get("type") != "thinking"]
+
                 if blocks:
                     result.append({"role": "assistant", "content": blocks})
 
@@ -840,6 +893,7 @@ async def compress_context(config: dict, messages: list, req_id: str = "") -> li
         return messages
 
     split = len(messages) - keep
+
     if split < 2:
         return messages
 
@@ -883,6 +937,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: st
                   finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
 
         proxy_tools = _extract_proxy_tool_calls(openai_resp)
+
         if not proxy_tools:
             break
 
@@ -892,15 +947,18 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: st
         for tc in proxy_tools:
             fn = tc["function"]
             tool_name = fn["name"]
+
             try:
                 tool_input = json.loads(fn.get("arguments", "{}"))
             except json.JSONDecodeError:
                 tool_input = {}
+
             try:
                 result = await execute_proxy_tool(config, tool_name, tool_input, req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
                 lg.log(f"tool error {tool_name}: {e}", req_id=req_id)
+
             openai_body["messages"].append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -923,6 +981,7 @@ async def call_anthropic(body: dict, base_url: str, api_key: str, client_headers
     if client_headers:
         for h in _FORWARD_HEADERS:
             v = client_headers.get(h)
+
             if v:
                 headers[h] = v
 
@@ -930,9 +989,12 @@ async def call_anthropic(body: dict, base_url: str, api_key: str, client_headers
         headers["x-api-key"] = api_key
     elif client_headers:
         auth = client_headers.get("authorization")
+
         if auth:
             headers["authorization"] = auth
+
         xapi = client_headers.get("x-api-key")
+
         if xapi:
             headers["x-api-key"] = xapi
 
@@ -953,6 +1015,7 @@ def _extract_proxy_tool_uses(anthropic_resp: dict) -> list:
 
 async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
     resp: dict = {}
+
     for _ in range(6):
         lg.debug_log(config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
                   model=body.get("model", ""),
@@ -964,23 +1027,27 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id:
                   stop=resp.get("stop_reason"))
 
         proxy_uses = _extract_proxy_tool_uses(resp)
+
         if not proxy_uses:
             break
 
         body["messages"].append({"role": "assistant", "content": resp.get("content", [])})
 
         tool_results = []
+
         for tu in proxy_uses:
             try:
                 result = await execute_proxy_tool(config, tu["name"], tu.get("input", {}), req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
                 lg.log(f"tool error {tu['name']}: {e}", req_id=req_id)
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu["id"],
                 "content": result,
             })
+
         body["messages"].append({"role": "user", "content": tool_results})
 
     return resp
@@ -993,30 +1060,41 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id:
 
 def _enrich_with_rag(body: dict, config: dict, req_id: str):
     chunk_size = config.get("rag_chunk_size", 2000)
+
     for msg in body.get("messages", []):
         text = _extract_msg_text(msg)
+
         if text:
             rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, chunk_size)
+
     last_text = _extract_last_user_text(body.get("messages", []))
+
     if not last_text:
         return
+
     rag_results = rag_instance.search(last_text, config.get("rag_max_results", 3))
+
     if not rag_results:
         return
+
     rag_block = "\n".join(
         f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
         for r in rag_results
     )
     messages = body.get("messages", [])
+
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
             suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+
             if isinstance(content, str):
                 msg["content"] = content + suffix
             elif isinstance(content, list):
                 content.append({"type": "text", "text": suffix})
+
             break
+
     hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
     lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
     lg.debug_log(config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
@@ -1087,6 +1165,7 @@ async def create_message(request: Request):
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
+
         else:
             usage = anthropic_resp.get("usage", {})
             lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
@@ -1100,9 +1179,11 @@ async def create_message(request: Request):
             error_body = e.response.json()
         except Exception:
             error_body = None
+
         lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
         lg.debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
         return translate_openai_error(e.response.status_code, error_body)
+
     except Exception as e:
         lg.log(f"ERROR {e}", req_id=req_id)
         lg.debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
@@ -1115,19 +1196,24 @@ def _count_content_chars(content) -> int:
 
     if isinstance(content, list):
         total = 0
+
         for block in content:
             btype = block.get("type", "")
+
             if btype == "text":
                 total += len(block.get("text", ""))
             elif btype == "tool_result":
                 sub = block.get("content", "")
+
                 if isinstance(sub, str):
                     total += len(sub)
                 elif isinstance(sub, list):
                     for sb in sub:
                         total += len(sb.get("text", ""))
+
             elif btype == "tool_use":
                 total += len(json.dumps(block.get("input", {})))
+
         return total
 
     return 0
@@ -1184,8 +1270,10 @@ def cmd_serve(args: argparse.Namespace):
     global rag_instance
 
     config = cx.load_config(args.config)
+
     if args.debug:
         config["debug"] = True
+
     if args.port:
         config["port"] = args.port
 
@@ -1199,12 +1287,15 @@ def cmd_serve(args: argparse.Namespace):
 
     info(f"Proxy starting on {host}:{port}")
     info("Endpoints:")
+
     for role, ep in endpoints.items():
         info(f"  {role} [{ep['protocol']}]: {ep['base_url']} -> {ep['model']}")
+
     if "compress" in endpoints:
         info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
 
     rag_dirs = config.get("rag_dirs", [])
+
     if rag_dirs:
         exts = config.get("rag_extensions")
         chunk_size = config.get("rag_chunk_size", 2000)
@@ -1214,6 +1305,7 @@ def cmd_serve(args: argparse.Namespace):
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
+
     info("")
     info("Usage:")
     info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
