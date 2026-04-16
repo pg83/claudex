@@ -110,8 +110,6 @@ class RAG:
                         print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
 
         self.n_chunks = len(self.cache)
-        paths = self.db.execute("SELECT DISTINCT json_extract(chunk, '$.path') FROM chunks").fetchall()
-        self.n_files = len(paths)
 
     def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
         added = 0
