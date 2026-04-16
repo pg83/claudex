@@ -801,11 +801,14 @@ async def stream_translate(
 # ---------------------------------------------------------------------------
 
 
-async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: str) -> Union[httpx.Response, dict]:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None) -> Union[httpx.Response, dict]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif client_headers:
+        auth = client_headers.get("authorization")
+        if auth:
+            headers["Authorization"] = auth
     url = _chat_url(base_url)
 
     if stream:
@@ -1100,7 +1103,7 @@ async def compress_context(messages: list, req_id: str = "") -> list:
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str) -> dict:
+async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
     """Call OpenAI, execute proxy-handled tools in a loop, return final response."""
     for _tool_iter in range(6):  # max 5 tool round-trips + 1 final
         debug_log("OPENAI REQUEST", openai_body, req_id=req_id,
@@ -1109,7 +1112,8 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str) -> dict:
                   messages=len(openai_body.get("messages", [])))
 
         openai_resp = await call_openai(openai_body, stream=False,
-                                        base_url=ep["base_url"], api_key=ep["api_key"])
+                                        base_url=ep["base_url"], api_key=ep["api_key"],
+                                        client_headers=client_headers)
         debug_log("OPENAI RESPONSE", openai_resp, req_id=req_id,
                   finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
 
@@ -1316,7 +1320,7 @@ async def create_message(request: Request):
             openai_body = convert_request(body, ep["model"])
             openai_body["stream"] = False
             openai_body.pop("stream_options", None)
-            openai_resp = await _proxy_tool_loop(openai_body, ep, req_id)
+            openai_resp = await _proxy_tool_loop(openai_body, ep, req_id, client_headers=request.headers)
             anthropic_resp = convert_response(openai_resp, anthropic_model)
 
         if is_stream:
