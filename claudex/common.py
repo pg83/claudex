@@ -1,8 +1,9 @@
 """Shared config loading and endpoint resolution used by every subcommand."""
 
-import json
 import os
 import re
+import json
+
 from urllib.parse import urlparse
 
 

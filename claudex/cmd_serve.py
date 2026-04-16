@@ -13,13 +13,13 @@ from contextlib import asynccontextmanager
 
 from typing import AsyncIterator, Optional, Union
 
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
+from starlette.requests import Request
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, StreamingResponse
 
-import claudex.common as cx
 import claudex.log as lg
+import claudex.common as cx
 import claudex.rag as rag_mod
 
 
@@ -53,11 +53,14 @@ def _messages_url(base_url: str) -> str:
 @asynccontextmanager
 async def lifespan(app: Starlette):
     global http_client
+
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(300.0, connect=10.0),
         verify=False,
     )
+
     yield
+
     await http_client.aclose()
 
 
@@ -73,12 +76,14 @@ def gen_message_id() -> str:
 def to_anthropic_tool_id(openai_id: str) -> str:
     if openai_id.startswith("call_"):
         return "toolu_" + openai_id[5:]
+
     return openai_id
 
 
 def to_openai_tool_id(anthropic_id: str) -> str:
     if anthropic_id.startswith("toolu_"):
         return "call_" + anthropic_id[6:]
+
     return anthropic_id
 
 
@@ -96,6 +101,7 @@ def extract_system_text(system) -> str:
 
 def sse_event(event_type: str, data: dict) -> str:
     data.setdefault("type", event_type)
+
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
@@ -110,6 +116,7 @@ def _extract_text_content(content) -> str:
 
     if isinstance(content, list):
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+
         return " ".join(texts)
 
     return ""
@@ -484,9 +491,11 @@ def close_block_events(state: StreamState) -> list[str]:
     events.append(sse_event("content_block_stop", {
         "index": state.block_index,
     }))
+
     state.block_index += 1
     state.current_block_type = None
     state.current_tool_index = None
+
     return events
 
 
@@ -496,10 +505,12 @@ def open_block_events(state: StreamState, block_type: str, content_block: dict) 
 
     events = close_block_events(state)
     state.current_block_type = block_type
+
     events.append(sse_event("content_block_start", {
         "index": state.block_index,
         "content_block": content_block,
     }))
+
     return events
 
 
@@ -534,6 +545,7 @@ async def stream_translate(
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
                 lg.debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
+
                 break
 
             _chunk_count += 1
@@ -554,6 +566,7 @@ async def stream_translate(
                 if reasoning:
                     for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
                         yield ev
+
                     yield sse_event("content_block_delta", {
                         "index": state.block_index,
                         "delta": {"type": "thinking_delta", "thinking": reasoning},
@@ -564,6 +577,7 @@ async def stream_translate(
                 if text:
                     for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
                         yield ev
+
                     yield sse_event("content_block_delta", {
                         "index": state.block_index,
                         "delta": {"type": "text_delta", "text": text},
@@ -578,10 +592,12 @@ async def stream_translate(
                         if tc_idx != state.current_tool_index:
                             for ev in close_block_events(state):
                                 yield ev
+
                             tool_id = to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
                             tool_name = tc_delta.get("function", {}).get("name", "")
                             state.current_block_type = "tool_use"
                             state.current_tool_index = tc_idx
+
                             yield sse_event("content_block_start", {
                                 "index": state.block_index,
                                 "content_block": {
@@ -590,6 +606,7 @@ async def stream_translate(
                             })
 
                         args_chunk = tc_delta.get("function", {}).get("arguments", "")
+
                         if args_chunk:
                             yield sse_event("content_block_delta", {
                                 "index": state.block_index,
@@ -608,6 +625,7 @@ async def stream_translate(
         yield ev
 
     stop_reason = FINISH_REASON_MAP.get(finish_reason, "end_turn")
+
     yield sse_event("message_delta", {
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
         "usage": {"output_tokens": state.output_tokens},
@@ -648,7 +666,9 @@ async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: s
 
         if resp.status_code != 200:
             body = await resp.aread()
+
             await resp.aclose()
+
             raise httpx.HTTPStatusError(
                 f"OpenAI returned {resp.status_code}",
                 request=req,
@@ -679,6 +699,7 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
         "stop_sequence": None,
         "usage": {"input_tokens": 0, "output_tokens": 0},
     }})
+
     yield sse_event("ping", {})
 
     for idx, block in enumerate(anthropic_resp.get("content", [])):
@@ -688,20 +709,25 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
             yield sse_event("content_block_start", {
                 "index": idx, "content_block": {"type": "text", "text": ""},
             })
+
             yield sse_event("content_block_delta", {
                 "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")},
             })
+
             yield sse_event("content_block_stop", {"index": idx})
         elif btype == "thinking":
             yield sse_event("content_block_start", {
                 "index": idx, "content_block": {"type": "thinking", "thinking": ""},
             })
+
             yield sse_event("content_block_delta", {
                 "index": idx, "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")},
             })
+
             yield sse_event("content_block_delta", {
                 "index": idx, "delta": {"type": "signature_delta", "signature": ""},
             })
+
             yield sse_event("content_block_stop", {"index": idx})
         elif btype == "tool_use":
             yield sse_event("content_block_start", {
@@ -709,15 +735,18 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
                     "type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {},
                 },
             })
+
             yield sse_event("content_block_delta", {
                 "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}))},
             })
+
             yield sse_event("content_block_stop", {"index": idx})
 
     yield sse_event("message_delta", {
         "delta": {"stop_reason": anthropic_resp.get("stop_reason", "end_turn"), "stop_sequence": None},
         "usage": {"output_tokens": anthropic_resp.get("usage", {}).get("output_tokens", 0)},
     })
+
     yield sse_event("message_stop", {})
 
     usage = anthropic_resp.get("usage", {})
@@ -750,11 +779,13 @@ async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: 
         resp = await http_client.get(url, headers=_FETCH_HEADERS, timeout=15, follow_redirects=True)
         result = resp.text
         lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+
         return result
 
     if name in ("WebSearch", "web_search"):
         query = tool_input.get("query", "")
         lg.log(f"web_search {query}", req_id=req_id)
+
         resp = await http_client.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
@@ -762,8 +793,11 @@ async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: 
             timeout=15,
             follow_redirects=True,
         )
+
         result = resp.text
+
         lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+
         return result
 
     return f"Unknown tool: {name}"
@@ -777,6 +811,7 @@ def _extract_proxy_tool_calls(openai_resp: dict) -> list:
 
     msg = choices[0].get("message", {})
     tool_calls = msg.get("tool_calls") or []
+
     return [tc for tc in tool_calls if tc.get("function", {}).get("name") in PROXY_HANDLED_TOOLS]
 
 
@@ -805,6 +840,7 @@ def serialize_messages(messages: list) -> str:
 
 def _build_compress_body(messages: list, model: str) -> dict:
     serialized = serialize_messages(messages)
+
     return {
         "model": model,
         "messages": [
@@ -828,11 +864,13 @@ async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> s
         "Authorization": f"Bearer {ep['api_key']}",
         "Content-Type": "application/json",
     }
+
     url = _chat_url(ep["base_url"])
 
     resp = await http_client.post(url, json=compress_body, headers=headers)
     resp.raise_for_status()
     data = resp.json()
+
     if "response" in data and "choices" not in data:
         data = data["response"]
 
@@ -868,7 +906,6 @@ def _collapse_messages(messages: list) -> list:
                     for block in content:
                         if block.get("type") == "text" and block.get("text", "").strip():
                             user_text.append(block["text"])
-
         elif role == "assistant":
             flush_user_text()
 
@@ -882,6 +919,7 @@ def _collapse_messages(messages: list) -> list:
                     result.append({"role": "assistant", "content": blocks})
 
     flush_user_text()
+
     return result
 
 
@@ -906,8 +944,10 @@ async def compress_context(config: dict, messages: list, req_id: str = "") -> li
     original_total = len(json.dumps(messages, ensure_ascii=False))
     compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
     ratio = original_total / compressed_bytes if compressed_bytes else 0
+
     lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
         req_id=req_id)
+
     lg.debug_log(config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
               original_msgs=len(messages),
               compressed_to=len(compressed),
@@ -933,6 +973,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: st
         openai_resp = await call_openai(openai_body, stream=False,
                                         base_url=ep["base_url"], api_key=ep["api_key"],
                                         client_headers=client_headers)
+
         lg.debug_log(config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
                   finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
 
@@ -1003,6 +1044,7 @@ async def call_anthropic(body: dict, base_url: str, api_key: str, client_headers
     url = _messages_url(base_url)
     resp = await http_client.post(url, json=body, headers=headers)
     resp.raise_for_status()
+
     return resp.json()
 
 
@@ -1021,6 +1063,7 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id:
                   model=body.get("model", ""),
                   base_url=ep["base_url"],
                   messages=len(body.get("messages", [])))
+
         resp = await call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
                                     client_headers=client_headers)
         lg.debug_log(config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
@@ -1081,6 +1124,7 @@ def _enrich_with_rag(body: dict, config: dict, req_id: str):
         f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
         for r in rag_results
     )
+
     messages = body.get("messages", [])
 
     for msg in reversed(messages):
@@ -1182,11 +1226,13 @@ async def create_message(request: Request):
 
         lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
         lg.debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
+
         return translate_openai_error(e.response.status_code, error_body)
 
     except Exception as e:
         lg.log(f"ERROR {e}", req_id=req_id)
         lg.debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
+
         return error_response(500, "api_error", str(e))
 
 
@@ -1242,6 +1288,7 @@ async def list_models(request: Request):
     models = [f"claude-{role}" for role in endpoints if role != "compress"] or [
         "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
     ]
+
     return JSONResponse(content={
         "data": [
             {"id": m, "type": "model", "display_name": m, "created_at": "2025-01-01T00:00:00Z"}
@@ -1283,7 +1330,8 @@ def cmd_serve(args: argparse.Namespace):
     port = config.get("port", 8082)
     endpoints = config.get("endpoints", {})
 
-    def info(msg): print(msg, file=sys.stderr, flush=True)
+    def info(msg):
+        print(msg, file=sys.stderr, flush=True)
 
     info(f"Proxy starting on {host}:{port}")
     info("Endpoints:")
