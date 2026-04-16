@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import math
 import httpx
 import pickle
@@ -93,8 +92,17 @@ class RAG:
             os.makedirs(parent, exist_ok=True)
 
         self.db = sqlite3.connect(db_path)
+
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(chunks)")]
+
+        if cols and "chunk" in cols and "data" not in cols:
+            self.db.execute("DROP TABLE chunks")
+
         self.db.execute(
-            "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, chunk TEXT, embedding BLOB)"
+            "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, data TEXT, embedding BLOB)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS paths (sha TEXT, path TEXT, PRIMARY KEY (sha, path))"
         )
 
         for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM chunks"):
@@ -127,27 +135,33 @@ class RAG:
 
     def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
         added = 0
+        dirty = False
 
         for chunk in split_text(text, chunk_size):
             if not chunk.strip():
                 continue
 
-            doc = {"path": path, "data": chunk}
-            chunk_json = json.dumps(doc, ensure_ascii=False, sort_keys=True)
-            sha = hashlib.sha256(chunk_json.encode()).hexdigest()
+            sha = hashlib.sha256(chunk.encode()).hexdigest()
 
-            if sha in self.cache:
-                continue
+            if sha not in self.cache:
+                vec = self.embedder(chunk)
+                self.db.execute(
+                    "INSERT INTO chunks (sha, data, embedding) VALUES (?, ?, ?)",
+                    (sha, chunk, pickle.dumps(vec)),
+                )
+                self.cache[sha] = vec
+                added += 1
+                dirty = True
 
-            vec = self.embedder(chunk)
-            self.db.execute(
-                "INSERT INTO chunks (sha, chunk, embedding) VALUES (?, ?, ?)",
-                (sha, chunk_json, pickle.dumps(vec)),
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO paths (sha, path) VALUES (?, ?)",
+                (sha, path),
             )
-            self.cache[sha] = vec
-            added += 1
 
-        if added:
+            if cur.rowcount > 0:
+                dirty = True
+
+        if dirty:
             self.db.commit()
 
         return added
@@ -167,14 +181,24 @@ class RAG:
 
         shas = [sha for _, sha in top]
         placeholders = ",".join("?" * len(shas))
-        rows = self.db.execute(
-            f"SELECT sha, chunk FROM chunks WHERE sha IN ({placeholders})",
+        data_by_sha = {
+            sha: data
+            for sha, data in self.db.execute(
+                f"SELECT sha, data FROM chunks WHERE sha IN ({placeholders})",
+                shas,
+            )
+        }
+
+        paths_by_sha: dict[str, list[str]] = {}
+
+        for sha, path in self.db.execute(
+            f"SELECT sha, path FROM paths WHERE sha IN ({placeholders})",
             shas,
-        ).fetchall()
-        by_sha = {sha: json.loads(chunk_json) for sha, chunk_json in rows}
+        ):
+            paths_by_sha.setdefault(sha, []).append(path)
 
         return [
-            {"path": by_sha[sha]["path"], "data": by_sha[sha]["data"], "rank": sim}
+            {"paths": paths_by_sha.get(sha, []), "data": data_by_sha.get(sha, ""), "rank": sim}
             for sim, sha in top
-            if sha in by_sha
+            if sha in data_by_sha
         ]

@@ -1190,7 +1190,7 @@ class ProxyServer:
             return
 
         rag_block = "\n".join(
-            f"File: {r['path']}\n---\n{r['data']}\n---"
+            f"Files: {', '.join(r['paths'])}\n---\n{r['data']}\n---"
             for r in rag_results
         )
 
@@ -1213,7 +1213,8 @@ class ProxyServer:
 
         for r in rag_results:
             data_preview = r["data"][:200].replace("\n", " ")
-            lg.log(f"  rag hit: {r['path']}({r['rank']:.2f}) {data_preview!r}", req_id=req_id)
+            paths = ", ".join(r["paths"])
+            lg.log(f"  rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", req_id=req_id)
 
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
