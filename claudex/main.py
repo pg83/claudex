@@ -1,10 +1,22 @@
 """Claudex proxy CLI dispatcher."""
 
 import argparse
+import sys
+
+import httpx
 
 import claudex.cmd_anal as ca
 import claudex.cmd_models as cm
 import claudex.cmd_serve as cs
+
+
+def _dispatch(args):
+    if args.command == "serve":
+        cs.cmd_serve(args)
+    elif args.command == "models":
+        cm.cmd_models(args)
+    elif args.command == "anal":
+        ca.cmd_anal(args)
 
 
 def main():
@@ -25,14 +37,18 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "serve":
-        cs.cmd_serve(args)
-    elif args.command == "models":
-        cm.cmd_models(args)
-    elif args.command == "anal":
-        ca.cmd_anal(args)
-    else:
+    if not args.command:
         parser.print_help()
+        return
+
+    try:
+        _dispatch(args)
+    except httpx.HTTPStatusError as e:
+        sys.exit(f"HTTP {e.response.status_code}: {e.response.text}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        sys.exit(f"Error: {e}")
 
 
 if __name__ == "__main__":

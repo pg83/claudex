@@ -1,7 +1,6 @@
 """models subcommand: list models at an endpoint."""
 
 import argparse
-import sys
 
 import httpx
 
@@ -16,15 +15,10 @@ def cmd_models(args: argparse.Namespace):
     headers = {"Authorization": f"Bearer {api_key}"}
 
     print(f"Fetching models from {url} ...\n")
-    try:
-        with httpx.Client(verify=False, timeout=30.0) as client:
-            resp = client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        sys.exit(f"HTTP {e.response.status_code}: {e.response.text}")
-    except Exception as e:
-        sys.exit(f"Error: {e}")
+    with httpx.Client(verify=False, timeout=30.0) as client:
+        resp = client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
 
     if "response" in data and "data" not in data:
         data = data["response"]
