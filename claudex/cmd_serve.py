@@ -189,6 +189,19 @@ class ProxyServer:
 
                 break
 
+        note = (
+            "Tag <search> marks fuzzy-search results from your persistent "
+            "associative memory; consider them when answering."
+        )
+        system = body.get("system")
+
+        if isinstance(system, str):
+            body["system"] = (system + "\n\n" + note) if system else note
+        elif isinstance(system, list):
+            system.append({"type": "text", "text": note})
+        else:
+            body["system"] = note
+
         lg.log(suffix, sid=sid)
         lg.debug_log(self.config, "SEARCH", {"query": last_text, "results": hits}, req_id=req_id)
 
