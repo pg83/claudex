@@ -196,9 +196,9 @@ class ProxyServer:
         system = body.get("system")
 
         if isinstance(system, str):
-            body["system"] = (system + "\n\n" + note) if system else note
+            body["system"] = (note + "\n\n" + system) if system else note
         elif isinstance(system, list):
-            system.append({"type": "text", "text": note})
+            system.insert(0, {"type": "text", "text": note})
         else:
             body["system"] = note
 
