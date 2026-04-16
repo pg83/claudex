@@ -59,6 +59,17 @@ def _expand_env(s: str) -> str:
     return re.sub(r'\$([A-Za-z_][A-Za-z0-9_]*)', lambda m: os.environ.get(m.group(1), m.group(0)), s)
 
 
+_ANTHROPIC_HOSTS = ("anthropic.com",)
+
+
+def _infer_protocol(base_url: str) -> str:
+    from urllib.parse import urlparse
+    host = (urlparse(base_url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _ANTHROPIC_HOSTS):
+        return "anthropic"
+    return "openai"
+
+
 def load_config(path: str):
     """Load JSON config file and populate ENDPOINTS, FALLBACKS, CONFIG."""
     with open(path) as f:
@@ -96,11 +107,13 @@ def load_config(path: str):
 
     # Endpoints
     for role, ep in cfg.get("endpoints", {}).items():
+        base_url = _expand_env(ep.get("base_url", ""))
         ENDPOINTS[role] = {
-            "base_url": _expand_env(ep.get("base_url", "")),
+            "base_url": base_url,
             "model": _expand_env(ep.get("model", "")),
             "api_key": _expand_env(ep.get("api_key", shared_api_key)),
             "ssl_verify": ep.get("ssl_verify", False),
+            "protocol": ep.get("protocol") or _infer_protocol(base_url),
         }
 
 
@@ -1130,6 +1143,91 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, req_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic upstream (passthrough, no OpenAI conversion)
+# ---------------------------------------------------------------------------
+
+
+def _messages_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/messages"):
+        return base
+    return base + "/messages"
+
+
+_FORWARD_HEADERS = ("anthropic-beta", "anthropic-version", "user-agent")
+
+
+async def call_anthropic(body: dict, base_url: str, api_key: str, client_headers=None) -> dict:
+    headers = {"content-type": "application/json"}
+
+    if client_headers:
+        for h in _FORWARD_HEADERS:
+            v = client_headers.get(h)
+            if v:
+                headers[h] = v
+
+    if api_key:
+        headers["x-api-key"] = api_key
+    elif client_headers:
+        auth = client_headers.get("authorization")
+        if auth:
+            headers["authorization"] = auth
+        xapi = client_headers.get("x-api-key")
+        if xapi:
+            headers["x-api-key"] = xapi
+
+    headers.setdefault("anthropic-version", "2023-06-01")
+
+    url = _messages_url(base_url)
+    resp = await http_client.post(url, json=body, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _extract_proxy_tool_uses(anthropic_resp: dict) -> list:
+    return [
+        b for b in anthropic_resp.get("content", [])
+        if b.get("type") == "tool_use" and b.get("name") in PROXY_HANDLED_TOOLS
+    ]
+
+
+async def _proxy_tool_loop_anthropic(body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
+    """Call Anthropic upstream, execute proxy-handled tools in a loop."""
+    resp: dict = {}
+    for _ in range(6):
+        debug_log("ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
+                  model=body.get("model", ""),
+                  base_url=ep["base_url"],
+                  messages=len(body.get("messages", [])))
+        resp = await call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
+                                    client_headers=client_headers)
+        debug_log("ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
+                  stop=resp.get("stop_reason"))
+
+        proxy_uses = _extract_proxy_tool_uses(resp)
+        if not proxy_uses:
+            break
+
+        body["messages"].append({"role": "assistant", "content": resp.get("content", [])})
+
+        tool_results = []
+        for tu in proxy_uses:
+            try:
+                result = await execute_proxy_tool(tu["name"], tu.get("input", {}), req_id=req_id)
+            except Exception as e:
+                result = f"Error: {e}"
+                log(f"tool error {tu['name']}: {e}", req_id=req_id)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tu["id"],
+                "content": result,
+            })
+        body["messages"].append({"role": "user", "content": tool_results})
+
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # RAG enrichment
 # ---------------------------------------------------------------------------
 
@@ -1205,18 +1303,21 @@ async def create_message(request: Request):
         _enrich_with_rag(body, req_id)
 
     try:
-        openai_body = convert_request(body, ep["model"])
-    except Exception as e:
-        return error_response(400, "invalid_request_error", f"Request conversion error: {e}")
-
-    # All requests go through sync first to allow tool interception.
-    # If client wants stream, we fake-stream the final response.
-    openai_body["stream"] = False
-    openai_body.pop("stream_options", None)
-
-    try:
-        openai_resp = await _proxy_tool_loop(openai_body, ep, req_id)
-        anthropic_resp = convert_response(openai_resp, anthropic_model)
+        if ep.get("protocol") == "anthropic":
+            upstream_body = dict(body)
+            upstream_body["messages"] = list(body.get("messages", []))
+            upstream_body["model"] = ep["model"]
+            upstream_body["stream"] = False
+            anthropic_resp = await _proxy_tool_loop_anthropic(
+                upstream_body, ep, req_id, client_headers=request.headers,
+            )
+            anthropic_resp["model"] = anthropic_model
+        else:
+            openai_body = convert_request(body, ep["model"])
+            openai_body["stream"] = False
+            openai_body.pop("stream_options", None)
+            openai_resp = await _proxy_tool_loop(openai_body, ep, req_id)
+            anthropic_resp = convert_response(openai_resp, anthropic_model)
 
         if is_stream:
             debug_log("ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
@@ -1329,7 +1430,7 @@ def cmd_serve(args: argparse.Namespace):
     info(f"Proxy starting on {host}:{port}")
     info("Endpoints:")
     for role, ep in ENDPOINTS.items():
-        info(f"  {role}: {ep['base_url']} -> {ep['model']}")
+        info(f"  {role} [{ep['protocol']}]: {ep['base_url']} -> {ep['model']}")
     if "compress" in ENDPOINTS:
         info(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
 
