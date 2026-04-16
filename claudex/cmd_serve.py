@@ -341,7 +341,7 @@ class ProxyServer:
     def run(self):
         host = self.config.get("host", "127.0.0.1")
         port = self.config.get("port", 8082)
-        uvicorn.run(self.app, host=host, port=port, log_level="info")
+        uvicorn.run(self.app, host=host, port=port, log_level="info", access_log=False)
 
 
 # ---------------------------------------------------------------------------
