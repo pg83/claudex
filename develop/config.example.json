@@ -4,7 +4,8 @@
   "endpoints": {
     "opus": {
       "base_url": "https://api.anthropic.com/v1",
-      "model": "claude-haiku-4-5"
+      "model": "claude-haiku-4-5",
+      "proxy": "socks5://user:pass@host:1080"
     }
   },
 

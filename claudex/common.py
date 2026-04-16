@@ -84,6 +84,7 @@ def load_config(path: str) -> dict:
             "api_key": _expand_env(ep.get("api_key", shared_api_key)),
             "ssl_verify": ep.get("ssl_verify", False),
             "protocol": ep.get("protocol") or _infer_protocol(base_url),
+            "proxy": _expand_env(ep.get("proxy")) if ep.get("proxy") else None,
         }
 
     config["endpoints"] = endpoints

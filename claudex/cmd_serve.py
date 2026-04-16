@@ -849,7 +849,7 @@ class ProxyServer:
     def __init__(self, config: dict, rag: Optional[rag_mod.RAG] = None):
         self.config = config
         self.rag = rag
-        self.http_client: httpx.AsyncClient = None  # type: ignore[assignment]
+        self.clients: dict[Optional[str], httpx.AsyncClient] = {}
         self.app = Starlette(
             lifespan=self.lifespan,
             routes=[
@@ -859,18 +859,24 @@ class ProxyServer:
             ],
         )
 
+    def client(self, proxy: Optional[str] = None) -> httpx.AsyncClient:
+        if proxy not in self.clients:
+            self.clients[proxy] = httpx.AsyncClient(
+                timeout=httpx.Timeout(300.0, connect=10.0),
+                verify=False,
+                proxy=proxy,
+            )
+
+        return self.clients[proxy]
+
     @asynccontextmanager
     async def lifespan(self, app: Starlette):
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=10.0),
-            verify=False,
-        )
-
         yield
 
-        await self.http_client.aclose()
+        for c in self.clients.values():
+            await c.aclose()
 
-    async def call_openai(self, openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None) -> Union[httpx.Response, dict]:
+    async def call_openai(self, openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None, proxy: Optional[str] = None) -> Union[httpx.Response, dict]:
         headers = {"Content-Type": "application/json"}
 
         if api_key:
@@ -882,10 +888,11 @@ class ProxyServer:
                 headers["Authorization"] = auth
 
         url = chat_url(base_url)
+        http = self.client(proxy)
 
         if stream:
-            req = self.http_client.build_request("POST", url, json=openai_body, headers=headers)
-            resp = await self.http_client.send(req, stream=True)
+            req = http.build_request("POST", url, json=openai_body, headers=headers)
+            resp = await http.send(req, stream=True)
 
             if resp.status_code != 200:
                 body = await resp.aread()
@@ -901,7 +908,7 @@ class ProxyServer:
             return resp
 
         else:
-            resp = await self.http_client.post(url, json=openai_body, headers=headers)
+            resp = await http.post(url, json=openai_body, headers=headers)
             resp.raise_for_status()
             data = resp.json()
 
@@ -910,7 +917,7 @@ class ProxyServer:
 
             return data
 
-    async def call_anthropic(self, body: dict, base_url: str, api_key: str, client_headers=None) -> dict:
+    async def call_anthropic(self, body: dict, base_url: str, api_key: str, client_headers=None, proxy: Optional[str] = None) -> dict:
         headers = {"content-type": "application/json"}
 
         if client_headers:
@@ -936,7 +943,7 @@ class ProxyServer:
         headers.setdefault("anthropic-version", "2023-06-01")
 
         url = messages_url(base_url)
-        resp = await self.http_client.post(url, json=body, headers=headers)
+        resp = await self.client(proxy).post(url, json=body, headers=headers)
         resp.raise_for_status()
 
         return resp.json()
@@ -953,7 +960,7 @@ class ProxyServer:
 
         url = chat_url(ep["base_url"])
 
-        resp = await self.http_client.post(url, json=compress_body, headers=headers)
+        resp = await self.client(ep.get("proxy")).post(url, json=compress_body, headers=headers)
         resp.raise_for_status()
         data = resp.json()
 
@@ -968,7 +975,7 @@ class ProxyServer:
         if name == "WebFetch":
             url = tool_input.get("url", "")
             lg.log(f"web_fetch {url}", req_id=req_id)
-            resp = await self.http_client.get(url, headers=FETCH_HEADERS, timeout=15, follow_redirects=True)
+            resp = await self.client().get(url, headers=FETCH_HEADERS, timeout=15, follow_redirects=True)
             result = resp.text
             lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
 
@@ -978,7 +985,7 @@ class ProxyServer:
             query = tool_input.get("query", "")
             lg.log(f"web_search {query}", req_id=req_id)
 
-            resp = await self.http_client.get(
+            resp = await self.client().get(
                 "https://html.duckduckgo.com/html/",
                 params={"q": query},
                 headers=FETCH_HEADERS,
@@ -1003,7 +1010,8 @@ class ProxyServer:
 
             openai_resp = await self.call_openai(openai_body, stream=False,
                                             base_url=ep["base_url"], api_key=ep["api_key"],
-                                            client_headers=client_headers)
+                                            client_headers=client_headers,
+                                            proxy=ep.get("proxy"))
 
             lg.debug_log(self.config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
                       finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
@@ -1049,7 +1057,8 @@ class ProxyServer:
                       messages=len(body.get("messages", [])))
 
             resp = await self.call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
-                                        client_headers=client_headers)
+                                        client_headers=client_headers,
+                                        proxy=ep.get("proxy"))
             lg.debug_log(self.config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
                       stop=resp.get("stop_reason"))
 
