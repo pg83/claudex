@@ -1208,8 +1208,13 @@ class ProxyServer:
 
                 break
 
-        hits = " | ".join(f"{r['path']}({r['rank']:.2f})" for r in rag_results)
-        lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
+        q_preview = last_text[:200].replace("\n", " ")
+        lg.log(f"rag query: {q_preview!r}", req_id=req_id)
+
+        for r in rag_results:
+            data_preview = r["data"][:200].replace("\n", " ")
+            lg.log(f"  rag hit: {r['path']}({r['rank']:.2f}) {data_preview!r}", req_id=req_id)
+
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
     async def create_message(self, request: Request):
