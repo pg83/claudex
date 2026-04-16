@@ -190,7 +190,7 @@ class ProxyServer:
         for r in rag_results:
             data_preview = r["data"][:200].replace("\n", " ")
             paths = ", ".join(r["paths"])
-            lg.log(f"  rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", sid=sid)
+            lg.log(f"rag hit: {paths}({r['rank']:.2f}) {data_preview!r}", sid=sid)
 
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
