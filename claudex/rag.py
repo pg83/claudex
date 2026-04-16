@@ -68,7 +68,7 @@ class RAG:
         embedder: Callable[[str], list[float]] = default_embedder,
     ):
         self.embedder = embedder
-        self.cache: dict[str, tuple[list[float], dict]] = {}
+        self.cache: dict[str, list[float]] = {}
 
         db_path = os.path.expanduser(db_path)
         parent = os.path.dirname(db_path)
@@ -81,8 +81,8 @@ class RAG:
             "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, chunk TEXT, embedding BLOB)"
         )
 
-        for sha, chunk_json, emb_blob in self.db.execute("SELECT sha, chunk, embedding FROM chunks"):
-            self.cache[sha] = (pickle.loads(emb_blob), json.loads(chunk_json))
+        for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM chunks"):
+            self.cache[sha] = pickle.loads(emb_blob)
 
         if directories:
             if isinstance(directories, str):
@@ -110,7 +110,8 @@ class RAG:
                         print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
 
         self.n_chunks = len(self.cache)
-        self.n_files = len({doc["path"] for _, doc in self.cache.values()})
+        paths = self.db.execute("SELECT DISTINCT json_extract(chunk, '$.path') FROM chunks").fetchall()
+        self.n_files = len(paths)
 
     def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
         added = 0
@@ -128,7 +129,7 @@ class RAG:
                 "INSERT INTO chunks (sha, chunk, embedding) VALUES (?, ?, ?)",
                 (sha, chunk_json, pickle.dumps(vec)),
             )
-            self.cache[sha] = (vec, doc)
+            self.cache[sha] = vec
             added += 1
 
         if added:
@@ -141,15 +142,24 @@ class RAG:
             return []
 
         qvec = self.embedder(query)
-        scored = []
-
-        for vec, doc in self.cache.values():
-            sim = cosine(qvec, vec)
-            scored.append((sim, doc))
-
+        scored = [(cosine(qvec, vec), sha) for sha, vec in self.cache.items()]
         scored.sort(key=lambda x: x[0], reverse=True)
 
+        top = scored[:limit]
+
+        if not top:
+            return []
+
+        shas = [sha for _, sha in top]
+        placeholders = ",".join("?" * len(shas))
+        rows = self.db.execute(
+            f"SELECT sha, chunk FROM chunks WHERE sha IN ({placeholders})",
+            shas,
+        ).fetchall()
+        by_sha = {sha: json.loads(chunk_json) for sha, chunk_json in rows}
+
         return [
-            {"path": doc["path"], "data": doc["data"], "rank": sim}
-            for sim, doc in scored[:limit]
+            {"path": by_sha[sha]["path"], "data": by_sha[sha]["data"], "rank": sim}
+            for sim, sha in top
+            if sha in by_sha
         ]
