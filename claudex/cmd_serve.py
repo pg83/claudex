@@ -14,12 +14,12 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from common import _strip_chat_suffix, load_config, resolve_endpoint
-from rag import RAG
+import claudex.common as cx
+import claudex.rag as rag_mod
 
 
 http_client: httpx.AsyncClient = None  # type: ignore[assignment]
-rag_instance: RAG = None  # type: ignore[assignment]
+rag_instance: rag_mod.RAG = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ rag_instance: RAG = None  # type: ignore[assignment]
 
 
 def _chat_url(base_url: str) -> str:
-    return _strip_chat_suffix(base_url) + "/chat/completions"
+    return cx._strip_chat_suffix(base_url) + "/chat/completions"
 
 
 def _messages_url(base_url: str) -> str:
@@ -828,7 +828,7 @@ def _build_compress_body(messages: list, model: str) -> dict:
 
 
 async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> str:
-    ep = resolve_endpoint(config, "compress")
+    ep = cx.resolve_endpoint(config, "compress")
     compress_body = _build_compress_body(messages, ep["model"])
     debug_log(config, "COMPRESS_REQ", compress_body, req_id=req_id)
 
@@ -1097,7 +1097,7 @@ async def create_message(request: Request):
 
     anthropic_model = body.get("model", "")
     is_stream = body.get("stream", False)
-    ep = resolve_endpoint(config, anthropic_model)
+    ep = cx.resolve_endpoint(config, anthropic_model)
     n_msgs = len(body.get("messages", []))
     n_tools = len(body.get("tools", []))
     body_bytes = len(json.dumps(body))
@@ -1234,7 +1234,7 @@ async def list_models(request: Request):
 def cmd_serve(args: argparse.Namespace):
     global rag_instance
 
-    config = load_config(args.config)
+    config = cx.load_config(args.config)
     if args.debug:
         config["debug"] = True
     if args.port:
@@ -1260,7 +1260,7 @@ def cmd_serve(args: argparse.Namespace):
         exts = config.get("rag_extensions")
         chunk_size = config.get("rag_chunk_size", 2000)
         dirs = [os.path.expanduser(d) for d in rag_dirs]
-        rag_instance = RAG(dirs, set(exts) if exts else None, chunk_size)
+        rag_instance = rag_mod.RAG(dirs, set(exts) if exts else None, chunk_size)
         info(f"RAG: {rag_instance.n_files} files, {rag_instance.n_chunks} chunks from {', '.join(dirs)}")
 
     if config["debug"]:

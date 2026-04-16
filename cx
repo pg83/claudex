@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+me = os.path.normpath(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(me))
+
+import claudex.main as cm
+
+if __name__ == "__main__":
+    cm.main()

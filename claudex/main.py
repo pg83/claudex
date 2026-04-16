@@ -1,18 +1,13 @@
-#!/usr/bin/env python3
-"""Claudex proxy CLI entry point.
-
-Shared config lives in common.py; each subcommand owns its own
-cmd_*.py module.
-"""
+"""Claudex proxy CLI dispatcher."""
 
 import argparse
 
+import claudex.cmd_anal as ca
+import claudex.cmd_models as cm
+import claudex.cmd_serve as cs
+
 
 def main():
-    from cmd_anal import cmd_anal
-    from cmd_models import cmd_models
-    from cmd_serve import cmd_serve
-
     parser = argparse.ArgumentParser(description="Claudex proxy")
     sub = parser.add_subparsers(dest="command")
 
@@ -32,11 +27,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == "serve":
-        cmd_serve(args)
+        cs.cmd_serve(args)
     elif args.command == "models":
-        cmd_models(args)
+        cm.cmd_models(args)
     elif args.command == "anal":
-        cmd_anal(args)
+        ca.cmd_anal(args)
     else:
         parser.print_help()
 
