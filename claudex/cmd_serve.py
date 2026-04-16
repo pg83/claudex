@@ -1,9 +1,6 @@
-"""serve subcommand: Starlette proxy server."""
-
 import os
 import sys
 import json
-import time
 import uuid
 import httpx
 import uvicorn
@@ -23,45 +20,22 @@ import claudex.common as cx
 import claudex.rag as rag_mod
 
 
-http_client: httpx.AsyncClient = None  # type: ignore[assignment]
-rag_instance: rag_mod.RAG = None  # type: ignore[assignment]
-
-
 # ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
 
-def _chat_url(base_url: str) -> str:
+def chat_url(base_url: str) -> str:
     return cx._strip_chat_suffix(base_url) + "/chat/completions"
 
 
-def _messages_url(base_url: str) -> str:
+def messages_url(base_url: str) -> str:
     base = base_url.rstrip("/")
 
     if base.endswith("/messages"):
         return base
 
     return base + "/messages"
-
-
-# ---------------------------------------------------------------------------
-# Starlette app with shared http client
-# ---------------------------------------------------------------------------
-
-
-@asynccontextmanager
-async def lifespan(app: Starlette):
-    global http_client
-
-    http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(300.0, connect=10.0),
-        verify=False,
-    )
-
-    yield
-
-    await http_client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +84,7 @@ def sse_event(event_type: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _extract_text_content(content) -> str:
+def extract_text_content(content) -> str:
     if isinstance(content, str):
         return content
 
@@ -122,14 +96,14 @@ def _extract_text_content(content) -> str:
     return ""
 
 
-def _extract_msg_text(msg: dict) -> str:
-    return _extract_text_content(msg.get("content", ""))
+def extract_msg_text(msg: dict) -> str:
+    return extract_text_content(msg.get("content", ""))
 
 
-def _extract_last_user_text(messages: list) -> str:
+def extract_last_user_text(messages: list) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            return _extract_text_content(msg.get("content", ""))
+            return extract_text_content(msg.get("content", ""))
 
     return ""
 
@@ -199,7 +173,7 @@ def convert_tools(anthropic_tools: list) -> list:
     ]
 
 
-_TOOL_CHOICE_MAP = {"auto": "auto", "any": "required", "none": "none"}
+TOOL_CHOICE_MAP = {"auto": "auto", "any": "required", "none": "none"}
 
 
 def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
@@ -211,10 +185,10 @@ def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     if tc_type == "tool":
         return {"type": "function", "function": {"name": anthropic_tc["name"]}}
 
-    return _TOOL_CHOICE_MAP.get(tc_type, "auto")
+    return TOOL_CHOICE_MAP.get(tc_type, "auto")
 
 
-def _convert_user_msg(content) -> list[dict]:
+def convert_user_msg(content) -> list[dict]:
     if isinstance(content, list):
         tool_results = [b for b in content if b.get("type") == "tool_result"]
         other_blocks = [b for b in content if b.get("type") != "tool_result"]
@@ -240,7 +214,7 @@ def _convert_user_msg(content) -> list[dict]:
     return result
 
 
-def _convert_assistant_msg(content) -> dict:
+def convert_assistant_msg(content) -> dict:
     if isinstance(content, str):
         return {"role": "assistant", "content": content}
 
@@ -291,9 +265,9 @@ def convert_request(body: dict, openai_model: str) -> dict:
         content = msg.get("content", "")
 
         if role == "user":
-            openai_messages.extend(_convert_user_msg(content))
+            openai_messages.extend(convert_user_msg(content))
         elif role == "assistant":
-            openai_messages.append(_convert_assistant_msg(content))
+            openai_messages.append(convert_assistant_msg(content))
 
     openai_body: dict = {
         "model": openai_model,
@@ -538,8 +512,8 @@ async def stream_translate(
     yield sse_event("ping", {})
 
     finish_reason = None
-    _chunk_count = 0
-    _raw_chunks = []
+    chunk_count = 0
+    raw_chunks = []
 
     try:
         async for chunk in iter_openai_sse(openai_response):
@@ -548,8 +522,8 @@ async def stream_translate(
 
                 break
 
-            _chunk_count += 1
-            _raw_chunks.append(chunk)
+            chunk_count += 1
+            raw_chunks.append(chunk)
             lg.debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
@@ -635,57 +609,11 @@ async def stream_translate(
 
     lg.log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
         req_id=req_id)
-    lg.debug_log(config, "OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
-              chunks=_chunk_count,
+    lg.debug_log(config, "OPENAI RESPONSE (stream)", raw_chunks, req_id=req_id,
+              chunks=chunk_count,
               stop=stop_reason,
               input_tokens=state.input_tokens,
               output_tokens=state.output_tokens)
-
-
-# ---------------------------------------------------------------------------
-# OpenAI HTTP client
-# ---------------------------------------------------------------------------
-
-
-async def call_openai(openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None) -> Union[httpx.Response, dict]:
-    headers = {"Content-Type": "application/json"}
-
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    elif client_headers:
-        auth = client_headers.get("authorization")
-
-        if auth:
-            headers["Authorization"] = auth
-
-    url = _chat_url(base_url)
-
-    if stream:
-        req = http_client.build_request("POST", url, json=openai_body, headers=headers)
-        resp = await http_client.send(req, stream=True)
-
-        if resp.status_code != 200:
-            body = await resp.aread()
-
-            await resp.aclose()
-
-            raise httpx.HTTPStatusError(
-                f"OpenAI returned {resp.status_code}",
-                request=req,
-                response=resp,
-            )
-
-        return resp
-
-    else:
-        resp = await http_client.post(url, json=openai_body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if "response" in data and "choices" not in data:
-            data = data["response"]
-
-        return data
 
 
 async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> AsyncIterator[str]:
@@ -754,9 +682,10 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
         req_id=req_id)
 
 
-async def _debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) -> AsyncIterator[str]:
+async def debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) -> AsyncIterator[str]:
     async for event_str in gen:
         lg.debug_sse(config, "out", event_str, req_id=req_id)
+
         yield event_str
 
 
@@ -767,43 +696,15 @@ async def _debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str)
 PROXY_HANDLED_TOOLS = {"WebFetch", "WebSearch", "web_search"}
 
 
-_FETCH_HEADERS = {
+FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
 
-async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: str = "") -> str:
-    if name == "WebFetch":
-        url = tool_input.get("url", "")
-        lg.log(f"web_fetch {url}", req_id=req_id)
-        resp = await http_client.get(url, headers=_FETCH_HEADERS, timeout=15, follow_redirects=True)
-        result = resp.text
-        lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
-
-        return result
-
-    if name in ("WebSearch", "web_search"):
-        query = tool_input.get("query", "")
-        lg.log(f"web_search {query}", req_id=req_id)
-
-        resp = await http_client.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers=_FETCH_HEADERS,
-            timeout=15,
-            follow_redirects=True,
-        )
-
-        result = resp.text
-
-        lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
-
-        return result
-
-    return f"Unknown tool: {name}"
+FORWARD_HEADERS = ("anthropic-beta", "anthropic-version", "user-agent")
 
 
-def _extract_proxy_tool_calls(openai_resp: dict) -> list:
+def extract_proxy_tool_calls(openai_resp: dict) -> list:
     choices = openai_resp.get("choices", [])
 
     if not choices:
@@ -813,6 +714,13 @@ def _extract_proxy_tool_calls(openai_resp: dict) -> list:
     tool_calls = msg.get("tool_calls") or []
 
     return [tc for tc in tool_calls if tc.get("function", {}).get("name") in PROXY_HANDLED_TOOLS]
+
+
+def extract_proxy_tool_uses(anthropic_resp: dict) -> list:
+    return [
+        b for b in anthropic_resp.get("content", [])
+        if b.get("type") == "tool_use" and b.get("name") in PROXY_HANDLED_TOOLS
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +746,7 @@ def serialize_messages(messages: list) -> str:
     return json.dumps(messages, ensure_ascii=False)
 
 
-def _build_compress_body(messages: list, model: str) -> dict:
+def build_compress_body(messages: list, model: str) -> dict:
     serialized = serialize_messages(messages)
 
     return {
@@ -855,31 +763,7 @@ def _build_compress_body(messages: list, model: str) -> dict:
     }
 
 
-async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> str:
-    ep = cx.resolve_endpoint(config, "compress")
-    compress_body = _build_compress_body(messages, ep["model"])
-    lg.debug_log(config, "COMPRESS_REQ", compress_body, req_id=req_id)
-
-    headers = {
-        "Authorization": f"Bearer {ep['api_key']}",
-        "Content-Type": "application/json",
-    }
-
-    url = _chat_url(ep["base_url"])
-
-    resp = await http_client.post(url, json=compress_body, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if "response" in data and "choices" not in data:
-        data = data["response"]
-
-    lg.debug_log(config, "COMPRESS_RESP", data, req_id=req_id)
-
-    return data["choices"][0]["message"]["content"] or ""
-
-
-def _collapse_messages(messages: list) -> list:
+def collapse_messages(messages: list) -> list:
     result = []
     user_text = []
 
@@ -923,320 +807,12 @@ def _collapse_messages(messages: list) -> list:
     return result
 
 
-async def compress_context(config: dict, messages: list, req_id: str = "") -> list:
-    keep = config["compress_keep"]
-    min_msgs = config["compress_min"]
-
-    if len(messages) < min_msgs:
-        return messages
-
-    split = len(messages) - keep
-
-    if split < 2:
-        return messages
-
-    to_collapse = messages[:split]
-    tail = messages[split:]
-
-    collapsed = _collapse_messages(to_collapse)
-    compressed = [*collapsed, *tail]
-
-    original_total = len(json.dumps(messages, ensure_ascii=False))
-    compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
-    ratio = original_total / compressed_bytes if compressed_bytes else 0
-
-    lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
-        req_id=req_id)
-
-    lg.debug_log(config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
-              original_msgs=len(messages),
-              compressed_to=len(compressed),
-              kept_verbatim=len(tail),
-              original_total=original_total,
-              compressed_bytes=compressed_bytes)
-
-    return compressed
-
-
 # ---------------------------------------------------------------------------
-# Proxy tool loop (OpenAI path)
+# Token counting
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
-    for _tool_iter in range(6):
-        lg.debug_log(config, "OPENAI REQUEST", openai_body, req_id=req_id,
-                  model=openai_body.get("model", ""),
-                  base_url=ep["base_url"],
-                  messages=len(openai_body.get("messages", [])))
-
-        openai_resp = await call_openai(openai_body, stream=False,
-                                        base_url=ep["base_url"], api_key=ep["api_key"],
-                                        client_headers=client_headers)
-
-        lg.debug_log(config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
-                  finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
-
-        proxy_tools = _extract_proxy_tool_calls(openai_resp)
-
-        if not proxy_tools:
-            break
-
-        assistant_msg = openai_resp["choices"][0]["message"]
-        openai_body["messages"].append(assistant_msg)
-
-        for tc in proxy_tools:
-            fn = tc["function"]
-            tool_name = fn["name"]
-
-            try:
-                tool_input = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                tool_input = {}
-
-            try:
-                result = await execute_proxy_tool(config, tool_name, tool_input, req_id=req_id)
-            except Exception as e:
-                result = f"Error: {e}"
-                lg.log(f"tool error {tool_name}: {e}", req_id=req_id)
-
-            openai_body["messages"].append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result,
-            })
-
-    return openai_resp
-
-
-# ---------------------------------------------------------------------------
-# Anthropic passthrough upstream
-# ---------------------------------------------------------------------------
-
-_FORWARD_HEADERS = ("anthropic-beta", "anthropic-version", "user-agent")
-
-
-async def call_anthropic(body: dict, base_url: str, api_key: str, client_headers=None) -> dict:
-    headers = {"content-type": "application/json"}
-
-    if client_headers:
-        for h in _FORWARD_HEADERS:
-            v = client_headers.get(h)
-
-            if v:
-                headers[h] = v
-
-    if api_key:
-        headers["x-api-key"] = api_key
-    elif client_headers:
-        auth = client_headers.get("authorization")
-
-        if auth:
-            headers["authorization"] = auth
-
-        xapi = client_headers.get("x-api-key")
-
-        if xapi:
-            headers["x-api-key"] = xapi
-
-    headers.setdefault("anthropic-version", "2023-06-01")
-
-    url = _messages_url(base_url)
-    resp = await http_client.post(url, json=body, headers=headers)
-    resp.raise_for_status()
-
-    return resp.json()
-
-
-def _extract_proxy_tool_uses(anthropic_resp: dict) -> list:
-    return [
-        b for b in anthropic_resp.get("content", [])
-        if b.get("type") == "tool_use" and b.get("name") in PROXY_HANDLED_TOOLS
-    ]
-
-
-async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
-    resp: dict = {}
-
-    for _ in range(6):
-        lg.debug_log(config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
-                  model=body.get("model", ""),
-                  base_url=ep["base_url"],
-                  messages=len(body.get("messages", [])))
-
-        resp = await call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
-                                    client_headers=client_headers)
-        lg.debug_log(config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
-                  stop=resp.get("stop_reason"))
-
-        proxy_uses = _extract_proxy_tool_uses(resp)
-
-        if not proxy_uses:
-            break
-
-        body["messages"].append({"role": "assistant", "content": resp.get("content", [])})
-
-        tool_results = []
-
-        for tu in proxy_uses:
-            try:
-                result = await execute_proxy_tool(config, tu["name"], tu.get("input", {}), req_id=req_id)
-            except Exception as e:
-                result = f"Error: {e}"
-                lg.log(f"tool error {tu['name']}: {e}", req_id=req_id)
-
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tu["id"],
-                "content": result,
-            })
-
-        body["messages"].append({"role": "user", "content": tool_results})
-
-    return resp
-
-
-# ---------------------------------------------------------------------------
-# RAG enrichment
-# ---------------------------------------------------------------------------
-
-
-def _enrich_with_rag(body: dict, config: dict, req_id: str):
-    chunk_size = config.get("rag_chunk_size", 2000)
-
-    for msg in body.get("messages", []):
-        text = _extract_msg_text(msg)
-
-        if text:
-            rag_instance.add(f"conversation/{req_id}/{msg['role']}", text, chunk_size)
-
-    last_text = _extract_last_user_text(body.get("messages", []))
-
-    if not last_text:
-        return
-
-    rag_results = rag_instance.search(last_text, config.get("rag_max_results", 3))
-
-    if not rag_results:
-        return
-
-    rag_block = "\n".join(
-        f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
-        for r in rag_results
-    )
-
-    messages = body.get("messages", [])
-
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
-
-            if isinstance(content, str):
-                msg["content"] = content + suffix
-            elif isinstance(content, list):
-                content.append({"type": "text", "text": suffix})
-
-            break
-
-    hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
-    lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
-    lg.debug_log(config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
-
-
-# ---------------------------------------------------------------------------
-# HTTP endpoints
-# ---------------------------------------------------------------------------
-
-
-async def create_message(request: Request):
-    config = request.app.state.config
-    req_id = lg.next_req_id()
-
-    try:
-        body = await request.json()
-    except Exception:
-        return error_response(400, "invalid_request_error", "Invalid JSON body")
-
-    anthropic_model = body.get("model", "")
-    is_stream = body.get("stream", False)
-    ep = cx.resolve_endpoint(config, anthropic_model)
-    n_msgs = len(body.get("messages", []))
-    n_tools = len(body.get("tools", []))
-    body_bytes = len(json.dumps(body))
-    stream_tag = "stream" if is_stream else "sync"
-
-    lg.log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {lg.human_bytes(body_bytes)}, {stream_tag}",
-        req_id=req_id)
-
-    lg.debug_log(config, "ANTHROPIC REQUEST", body, req_id=req_id,
-              model=anthropic_model, stream=is_stream,
-              endpoint_model=ep["model"],
-              messages=n_msgs, tools=n_tools)
-
-    if "compress" in config["endpoints"] and "messages" in body:
-        body["messages"] = await compress_context(config, body["messages"], req_id=req_id)
-
-    if rag_instance is not None:
-        _enrich_with_rag(body, config, req_id)
-
-    try:
-        if ep.get("protocol") == "anthropic":
-            upstream_body = dict(body)
-            upstream_body["messages"] = list(body.get("messages", []))
-            upstream_body["model"] = ep["model"]
-            upstream_body["stream"] = False
-            anthropic_resp = await _proxy_tool_loop_anthropic(
-                upstream_body, ep, config, req_id, client_headers=request.headers,
-            )
-            anthropic_resp["model"] = anthropic_model
-        else:
-            openai_body = convert_request(body, ep["model"])
-            openai_body["stream"] = False
-            openai_body.pop("stream_options", None)
-            openai_resp = await _proxy_tool_loop(openai_body, ep, config, req_id, client_headers=request.headers)
-            anthropic_resp = convert_response(openai_resp, anthropic_model)
-
-        if is_stream:
-            lg.debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
-                      stop=anthropic_resp.get("stop_reason"))
-            return StreamingResponse(
-                _debug_stream_wrap(
-                    fake_stream_from_response(anthropic_resp, req_id=req_id),
-                    config,
-                    req_id,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
-
-        else:
-            usage = anthropic_resp.get("usage", {})
-            lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
-                req_id=req_id)
-            lg.debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
-                      stop=anthropic_resp.get("stop_reason"))
-            return JSONResponse(content=anthropic_resp)
-
-    except httpx.HTTPStatusError as e:
-        try:
-            error_body = e.response.json()
-        except Exception:
-            error_body = None
-
-        lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
-        lg.debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
-
-        return translate_openai_error(e.response.status_code, error_body)
-
-    except Exception as e:
-        lg.log(f"ERROR {e}", req_id=req_id)
-        lg.debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
-
-        return error_response(500, "api_error", str(e))
-
-
-def _count_content_chars(content) -> int:
+def count_content_chars(content) -> int:
     if isinstance(content, str):
         return len(content)
 
@@ -1256,7 +832,6 @@ def _count_content_chars(content) -> int:
                 elif isinstance(sub, list):
                     for sb in sub:
                         total += len(sb.get("text", ""))
-
             elif btype == "tool_use":
                 total += len(json.dumps(block.get("input", {})))
 
@@ -1265,47 +840,440 @@ def _count_content_chars(content) -> int:
     return 0
 
 
-async def count_tokens(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(content={"input_tokens": 0})
-
-    total_chars = len(extract_system_text(body.get("system")))
-
-    for msg in body.get("messages", []):
-        total_chars += _count_content_chars(msg.get("content", ""))
-
-    if "tools" in body:
-        total_chars += len(json.dumps(body["tools"]))
-
-    return JSONResponse(content={"input_tokens": max(1, total_chars // 4)})
+# ---------------------------------------------------------------------------
+# ProxyServer
+# ---------------------------------------------------------------------------
 
 
-async def list_models(request: Request):
-    config = request.app.state.config
-    endpoints = config.get("endpoints", {})
-    models = [f"claude-{role}" for role in endpoints if role != "compress"] or [
-        "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
-    ]
+class ProxyServer:
+    def __init__(self, config: dict, rag: Optional[rag_mod.RAG] = None):
+        self.config = config
+        self.rag = rag
+        self.http_client: httpx.AsyncClient = None  # type: ignore[assignment]
+        self.app = Starlette(
+            lifespan=self.lifespan,
+            routes=[
+                Route("/v1/messages", self.create_message, methods=["POST"]),
+                Route("/v1/messages/count_tokens", self.count_tokens, methods=["POST"]),
+                Route("/v1/models", self.list_models, methods=["GET"]),
+            ],
+        )
 
-    return JSONResponse(content={
-        "data": [
-            {"id": m, "type": "model", "display_name": m, "created_at": "2025-01-01T00:00:00Z"}
-            for m in models
-        ],
-        "has_more": False,
-    })
+    @asynccontextmanager
+    async def lifespan(self, app: Starlette):
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            verify=False,
+        )
 
+        yield
 
-app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Route("/v1/messages", create_message, methods=["POST"]),
-        Route("/v1/messages/count_tokens", count_tokens, methods=["POST"]),
-        Route("/v1/models", list_models, methods=["GET"]),
-    ],
-)
+        await self.http_client.aclose()
+
+    async def call_openai(self, openai_body: dict, stream: bool, base_url: str, api_key: str, client_headers=None) -> Union[httpx.Response, dict]:
+        headers = {"Content-Type": "application/json"}
+
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif client_headers:
+            auth = client_headers.get("authorization")
+
+            if auth:
+                headers["Authorization"] = auth
+
+        url = chat_url(base_url)
+
+        if stream:
+            req = self.http_client.build_request("POST", url, json=openai_body, headers=headers)
+            resp = await self.http_client.send(req, stream=True)
+
+            if resp.status_code != 200:
+                body = await resp.aread()
+
+                await resp.aclose()
+
+                raise httpx.HTTPStatusError(
+                    f"OpenAI returned {resp.status_code}",
+                    request=req,
+                    response=resp,
+                )
+
+            return resp
+
+        else:
+            resp = await self.http_client.post(url, json=openai_body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "response" in data and "choices" not in data:
+                data = data["response"]
+
+            return data
+
+    async def call_anthropic(self, body: dict, base_url: str, api_key: str, client_headers=None) -> dict:
+        headers = {"content-type": "application/json"}
+
+        if client_headers:
+            for h in FORWARD_HEADERS:
+                v = client_headers.get(h)
+
+                if v:
+                    headers[h] = v
+
+        if api_key:
+            headers["x-api-key"] = api_key
+        elif client_headers:
+            auth = client_headers.get("authorization")
+
+            if auth:
+                headers["authorization"] = auth
+
+            xapi = client_headers.get("x-api-key")
+
+            if xapi:
+                headers["x-api-key"] = xapi
+
+        headers.setdefault("anthropic-version", "2023-06-01")
+
+        url = messages_url(base_url)
+        resp = await self.http_client.post(url, json=body, headers=headers)
+        resp.raise_for_status()
+
+        return resp.json()
+
+    async def call_compress_llm(self, messages: list, req_id: str = "") -> str:
+        ep = cx.resolve_endpoint(self.config, "compress")
+        compress_body = build_compress_body(messages, ep["model"])
+        lg.debug_log(self.config, "COMPRESS_REQ", compress_body, req_id=req_id)
+
+        headers = {
+            "Authorization": f"Bearer {ep['api_key']}",
+            "Content-Type": "application/json",
+        }
+
+        url = chat_url(ep["base_url"])
+
+        resp = await self.http_client.post(url, json=compress_body, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "response" in data and "choices" not in data:
+            data = data["response"]
+
+        lg.debug_log(self.config, "COMPRESS_RESP", data, req_id=req_id)
+
+        return data["choices"][0]["message"]["content"] or ""
+
+    async def execute_proxy_tool(self, name: str, tool_input: dict, req_id: str = "") -> str:
+        if name == "WebFetch":
+            url = tool_input.get("url", "")
+            lg.log(f"web_fetch {url}", req_id=req_id)
+            resp = await self.http_client.get(url, headers=FETCH_HEADERS, timeout=15, follow_redirects=True)
+            result = resp.text
+            lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+
+            return result
+
+        if name in ("WebSearch", "web_search"):
+            query = tool_input.get("query", "")
+            lg.log(f"web_search {query}", req_id=req_id)
+
+            resp = await self.http_client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers=FETCH_HEADERS,
+                timeout=15,
+                follow_redirects=True,
+            )
+
+            result = resp.text
+
+            lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+
+            return result
+
+        return f"Unknown tool: {name}"
+
+    async def proxy_tool_loop(self, openai_body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
+        for _ in range(6):
+            lg.debug_log(self.config, "OPENAI REQUEST", openai_body, req_id=req_id,
+                      model=openai_body.get("model", ""),
+                      base_url=ep["base_url"],
+                      messages=len(openai_body.get("messages", [])))
+
+            openai_resp = await self.call_openai(openai_body, stream=False,
+                                            base_url=ep["base_url"], api_key=ep["api_key"],
+                                            client_headers=client_headers)
+
+            lg.debug_log(self.config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
+                      finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
+
+            proxy_tools = extract_proxy_tool_calls(openai_resp)
+
+            if not proxy_tools:
+                break
+
+            assistant_msg = openai_resp["choices"][0]["message"]
+            openai_body["messages"].append(assistant_msg)
+
+            for tc in proxy_tools:
+                fn = tc["function"]
+                tool_name = fn["name"]
+
+                try:
+                    tool_input = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    tool_input = {}
+
+                try:
+                    result = await self.execute_proxy_tool(tool_name, tool_input, req_id=req_id)
+                except Exception as e:
+                    result = f"Error: {e}"
+                    lg.log(f"tool error {tool_name}: {e}", req_id=req_id)
+
+                openai_body["messages"].append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+        return openai_resp
+
+    async def proxy_tool_loop_anthropic(self, body: dict, ep: dict, req_id: str, client_headers=None) -> dict:
+        resp: dict = {}
+
+        for _ in range(6):
+            lg.debug_log(self.config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
+                      model=body.get("model", ""),
+                      base_url=ep["base_url"],
+                      messages=len(body.get("messages", [])))
+
+            resp = await self.call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
+                                        client_headers=client_headers)
+            lg.debug_log(self.config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
+                      stop=resp.get("stop_reason"))
+
+            proxy_uses = extract_proxy_tool_uses(resp)
+
+            if not proxy_uses:
+                break
+
+            body["messages"].append({"role": "assistant", "content": resp.get("content", [])})
+
+            tool_results = []
+
+            for tu in proxy_uses:
+                try:
+                    result = await self.execute_proxy_tool(tu["name"], tu.get("input", {}), req_id=req_id)
+                except Exception as e:
+                    result = f"Error: {e}"
+                    lg.log(f"tool error {tu['name']}: {e}", req_id=req_id)
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
+                    "content": result,
+                })
+
+            body["messages"].append({"role": "user", "content": tool_results})
+
+        return resp
+
+    async def compress_context(self, messages: list, req_id: str = "") -> list:
+        keep = self.config["compress_keep"]
+        min_msgs = self.config["compress_min"]
+
+        if len(messages) < min_msgs:
+            return messages
+
+        split = len(messages) - keep
+
+        if split < 2:
+            return messages
+
+        to_collapse = messages[:split]
+        tail = messages[split:]
+
+        collapsed = collapse_messages(to_collapse)
+        compressed = [*collapsed, *tail]
+
+        original_total = len(json.dumps(messages, ensure_ascii=False))
+        compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
+        ratio = original_total / compressed_bytes if compressed_bytes else 0
+
+        lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
+            req_id=req_id)
+
+        lg.debug_log(self.config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
+                  original_msgs=len(messages),
+                  compressed_to=len(compressed),
+                  kept_verbatim=len(tail),
+                  original_total=original_total,
+                  compressed_bytes=compressed_bytes)
+
+        return compressed
+
+    def enrich_with_rag(self, body: dict, req_id: str):
+        chunk_size = self.config.get("rag_chunk_size", 2000)
+
+        for msg in body.get("messages", []):
+            text = extract_msg_text(msg)
+
+            if text:
+                self.rag.add(f"conversation/{req_id}/{msg['role']}", text, chunk_size)
+
+        last_text = extract_last_user_text(body.get("messages", []))
+
+        if not last_text:
+            return
+
+        rag_results = self.rag.search(last_text, self.config.get("rag_max_results", 3))
+
+        if not rag_results:
+            return
+
+        rag_block = "\n".join(
+            f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
+            for r in rag_results
+        )
+
+        messages = body.get("messages", [])
+
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+
+                if isinstance(content, str):
+                    msg["content"] = content + suffix
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": suffix})
+
+                break
+
+        hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
+        lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
+        lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+
+    async def create_message(self, request: Request):
+        req_id = lg.next_req_id()
+
+        try:
+            body = await request.json()
+        except Exception:
+            return error_response(400, "invalid_request_error", "Invalid JSON body")
+
+        anthropic_model = body.get("model", "")
+        is_stream = body.get("stream", False)
+        ep = cx.resolve_endpoint(self.config, anthropic_model)
+        n_msgs = len(body.get("messages", []))
+        n_tools = len(body.get("tools", []))
+        body_bytes = len(json.dumps(body))
+        stream_tag = "stream" if is_stream else "sync"
+
+        lg.log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {lg.human_bytes(body_bytes)}, {stream_tag}",
+            req_id=req_id)
+
+        lg.debug_log(self.config, "ANTHROPIC REQUEST", body, req_id=req_id,
+                  model=anthropic_model, stream=is_stream,
+                  endpoint_model=ep["model"],
+                  messages=n_msgs, tools=n_tools)
+
+        if "compress" in self.config["endpoints"] and "messages" in body:
+            body["messages"] = await self.compress_context(body["messages"], req_id=req_id)
+
+        if self.rag is not None:
+            self.enrich_with_rag(body, req_id)
+
+        try:
+            if ep.get("protocol") == "anthropic":
+                upstream_body = dict(body)
+                upstream_body["messages"] = list(body.get("messages", []))
+                upstream_body["model"] = ep["model"]
+                upstream_body["stream"] = False
+                anthropic_resp = await self.proxy_tool_loop_anthropic(
+                    upstream_body, ep, req_id, client_headers=request.headers,
+                )
+                anthropic_resp["model"] = anthropic_model
+            else:
+                openai_body = convert_request(body, ep["model"])
+                openai_body["stream"] = False
+                openai_body.pop("stream_options", None)
+                openai_resp = await self.proxy_tool_loop(openai_body, ep, req_id, client_headers=request.headers)
+                anthropic_resp = convert_response(openai_resp, anthropic_model)
+
+            if is_stream:
+                lg.debug_log(self.config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+                          stop=anthropic_resp.get("stop_reason"))
+                return StreamingResponse(
+                    debug_stream_wrap(
+                        fake_stream_from_response(anthropic_resp, req_id=req_id),
+                        self.config,
+                        req_id,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
+
+            else:
+                usage = anthropic_resp.get("usage", {})
+                lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
+                    req_id=req_id)
+                lg.debug_log(self.config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+                          stop=anthropic_resp.get("stop_reason"))
+                return JSONResponse(content=anthropic_resp)
+
+        except httpx.HTTPStatusError as e:
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = None
+
+            lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
+            lg.debug_log(self.config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
+
+            return translate_openai_error(e.response.status_code, error_body)
+
+        except Exception as e:
+            lg.log(f"ERROR {e}", req_id=req_id)
+            lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
+
+            return error_response(500, "api_error", str(e))
+
+    async def count_tokens(self, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(content={"input_tokens": 0})
+
+        total_chars = len(extract_system_text(body.get("system")))
+
+        for msg in body.get("messages", []):
+            total_chars += count_content_chars(msg.get("content", ""))
+
+        if "tools" in body:
+            total_chars += len(json.dumps(body["tools"]))
+
+        return JSONResponse(content={"input_tokens": max(1, total_chars // 4)})
+
+    async def list_models(self, request: Request):
+        endpoints = self.config.get("endpoints", {})
+        models = [f"claude-{role}" for role in endpoints if role != "compress"] or [
+            "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
+        ]
+
+        return JSONResponse(content={
+            "data": [
+                {"id": m, "type": "model", "display_name": m, "created_at": "2025-01-01T00:00:00Z"}
+                for m in models
+            ],
+            "has_more": False,
+        })
+
+    def run(self):
+        host = self.config.get("host", "127.0.0.1")
+        port = self.config.get("port", 8082)
+        uvicorn.run(self.app, host=host, port=port, log_level="info")
 
 
 # ---------------------------------------------------------------------------
@@ -1314,8 +1282,6 @@ app = Starlette(
 
 
 def cmd_serve(args: argparse.Namespace):
-    global rag_instance
-
     config = cx.load_config(args.config)
 
     if args.debug:
@@ -1323,8 +1289,6 @@ def cmd_serve(args: argparse.Namespace):
 
     if args.port:
         config["port"] = args.port
-
-    app.state.config = config
 
     host = config.get("host", "127.0.0.1")
     port = config.get("port", 8082)
@@ -1342,14 +1306,15 @@ def cmd_serve(args: argparse.Namespace):
     if "compress" in endpoints:
         info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
 
+    rag = None
     rag_dirs = config.get("rag_dirs", [])
 
     if rag_dirs:
         exts = config.get("rag_extensions")
         chunk_size = config.get("rag_chunk_size", 2000)
         dirs = [os.path.expanduser(d) for d in rag_dirs]
-        rag_instance = rag_mod.RAG(dirs, set(exts) if exts else None, chunk_size)
-        info(f"RAG: {rag_instance.n_files} files, {rag_instance.n_chunks} chunks from {', '.join(dirs)}")
+        rag = rag_mod.RAG(dirs, set(exts) if exts else None, chunk_size)
+        info(f"RAG: {rag.n_files} files, {rag.n_chunks} chunks from {', '.join(dirs)}")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
@@ -1358,4 +1323,5 @@ def cmd_serve(args: argparse.Namespace):
     info("Usage:")
     info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
 
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    server = ProxyServer(config, rag)
+    server.run()
