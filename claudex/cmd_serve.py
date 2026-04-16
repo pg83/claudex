@@ -176,7 +176,7 @@ class ProxyServer:
         block = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
         messages = body.get("messages", [])
 
-        suffix = f"\n---\n<search>\n{block}\n</search>"
+        suffix = f"\n---\n<cx:search>\n{block}\n</cx:search>"
 
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -190,7 +190,7 @@ class ProxyServer:
                 break
 
         note = (
-            "Tag <search> marks fuzzy-search results from your persistent "
+            "Tag <cx:search> marks fuzzy-search results from your persistent "
             "associative memory; consider them when answering."
         )
         system = body.get("system")
