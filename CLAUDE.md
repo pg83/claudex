@@ -55,3 +55,27 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+## 5. Code Style
+
+**Imports.** Imports are split into three sections separated by blank lines: plain `import X` first (sorted by line length), then `from X import Y` lines (unrelated modules separated by blank lines, imports sharing a parent package grouped contiguously and sorted by module name length), then local modules last as `import claudex.X as alias`.
+
+**Blank lines.**
+- Two blank lines between top-level definitions.
+- Inside a function, surround compound statements (`if`/`for`/`while`/`try`/`with`) with one blank line — **except** when the block sits at the very start or end of its enclosing block.
+- Separate an assignment from a following block with a blank line.
+- Separate logical sections (setup / main / teardown) with blank lines.
+- Blank line before a trailing `return` that follows a block.
+
+```python
+def f(x):
+    if x is None:           # first stmt — no blank before
+        return None
+
+    y = compute(x)          # blank line before the next block
+
+    if y > 0:
+        handle(y)
+
+    return y                # blank line before trailing return
+```
