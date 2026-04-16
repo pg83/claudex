@@ -1,13 +1,18 @@
 """Claudex proxy CLI dispatcher."""
 
+import os
 import sys
 import httpx
+import signal
 import argparse
 
 import claudex.cmd_anal as ca
 import claudex.cmd_rag as cr
 import claudex.cmd_serve as cs
 import claudex.cmd_models as cm
+
+
+signal.signal(signal.SIGINT, lambda *_: os._exit(130))
 
 
 def _dispatch(args):
