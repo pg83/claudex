@@ -21,7 +21,6 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional, Union
 
 import httpx
-import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1418,105 +1417,11 @@ async def list_models():
 # ---------------------------------------------------------------------------
 
 
-def cmd_serve(args: argparse.Namespace):
-    """Start the proxy server."""
-    load_config(args.config)
-    if args.debug:
-        CONFIG["debug"] = True
-    if args.port:
-        CONFIG["port"] = args.port
-
-    host = CONFIG.get("host", "127.0.0.1")
-    port = CONFIG.get("port", 8082)
-
-    def info(msg): print(msg, file=sys.stderr, flush=True)
-
-    info(f"Proxy starting on {host}:{port}")
-    info("Endpoints:")
-    for role, ep in ENDPOINTS.items():
-        info(f"  {role} [{ep['protocol']}]: {ep['base_url']} -> {ep['model']}")
-    if "compress" in ENDPOINTS:
-        info(f"Compression: keep={CONFIG['compress_keep']}, min={CONFIG['compress_min']}")
-
-    global rag_instance
-    rag_dirs = CONFIG.get("rag_dirs", [])
-    if rag_dirs:
-        exts = CONFIG.get("rag_extensions")
-        chunk_size = CONFIG.get("rag_chunk_size", 2000)
-        dirs = [os.path.expanduser(d) for d in rag_dirs]
-        rag_instance = RAG(dirs, set(exts) if exts else None, chunk_size)
-        info(f"RAG: {rag_instance.n_files} files, {rag_instance.n_chunks} chunks from {', '.join(dirs)}")
-
-    if CONFIG["debug"]:
-        info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
-    info("")
-    info("Usage:")
-    info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
-
-    uvicorn.run(app, host=host, port=port, log_level="info")
-
-
-def cmd_models(args: argparse.Namespace):
-    """List models available at an endpoint."""
-    if args.base_url:
-        base_url = args.base_url
-        api_key = _expand_env(args.api_key or "")
-    elif args.config:
-        load_config(args.config)
-        if not ENDPOINTS:
-            sys.exit("No endpoints configured")
-        ep = next(iter(ENDPOINTS.values()))
-        base_url = ep["base_url"]
-        api_key = _expand_env(args.api_key) if args.api_key else ep["api_key"]
-    else:
-        sys.exit("Provide either config or --base-url")
-
-    url = _strip_chat_suffix(base_url) + "/models"
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    print(f"Fetching models from {url} ...\n")
-    try:
-        with httpx.Client(verify=False, timeout=30.0) as client:
-            resp = client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        sys.exit(f"HTTP {e.response.status_code}: {e.response.text}")
-    except Exception as e:
-        sys.exit(f"Error: {e}")
-
-    if "response" in data and "data" not in data:
-        data = data["response"]
-
-    models = data.get("data", [])
-    if not models:
-        print("No models returned.")
-        return
-
-    models.sort(key=lambda m: m.get("id", ""))
-    print(f"Found {len(models)} models:\n")
-    for m in models:
-        mid = m.get("id", "?")
-        owned_by = m.get("owned_by", "")
-        extra = f"  (by {owned_by})" if owned_by else ""
-        print(f"  {mid}{extra}")
-
-
-def cmd_anal(args: argparse.Namespace):
-    """Analyze debug log: pretty-print all events."""
-    for line in open(args.log):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        print(json.dumps(ev, indent=2, ensure_ascii=False))
-        print()
-
-
 def main():
+    from cmd_anal import cmd_anal
+    from cmd_models import cmd_models
+    from cmd_serve import cmd_serve
+
     parser = argparse.ArgumentParser(description="Anthropic -> OpenAI proxy")
     sub = parser.add_subparsers(dest="command")
 
