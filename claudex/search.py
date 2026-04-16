@@ -222,13 +222,17 @@ class WhooshEngine:
     def __init__(self, cfg: dict):
         from whoosh.fields import Schema, TEXT, ID
         from whoosh.filedb.filestore import RamStorage
+        from whoosh.analysis import NgramWordAnalyzer
 
         self.max_results = cfg.get("max_results", 5)
         self.snippet_chars = cfg.get("snippet_chars", 300)
 
+        ngram = cfg.get("ngram", 3)
+        analyzer = NgramWordAnalyzer(minsize=ngram, maxsize=ngram)
+
         self._schema = Schema(
             path=ID(stored=True, unique=True),
-            body=TEXT(stored=True),
+            body=TEXT(stored=True, analyzer=analyzer),
         )
         self._ix = RamStorage().create_index(self._schema)
 
