@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import math
+import httpx
 import pickle
 import hashlib
 import sqlite3
@@ -17,8 +18,22 @@ DEFAULT_EXTENSIONS = {
 }
 
 
+OLLAMA_URL = "http://localhost:11434/api/embed"
+OLLAMA_MODEL = "nomic-embed-text"
+
+_ollama_client: httpx.Client = None  # type: ignore[assignment]
+
+
 def default_embedder(text: str) -> list[float]:
-    return [1.0]
+    global _ollama_client
+
+    if _ollama_client is None:
+        _ollama_client = httpx.Client(timeout=60.0)
+
+    resp = _ollama_client.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "input": text})
+    resp.raise_for_status()
+
+    return resp.json()["embeddings"][0]
 
 
 def split_text(text: str, size: int) -> list[str]:
