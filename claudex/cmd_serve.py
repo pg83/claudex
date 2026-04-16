@@ -5,6 +5,9 @@ import httpx
 import uvicorn
 import argparse
 
+
+uvicorn.Server.install_signal_handlers = lambda self: None
+
 from contextlib import asynccontextmanager
 
 from typing import AsyncIterator, Optional
