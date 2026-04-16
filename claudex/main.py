@@ -5,6 +5,7 @@ import httpx
 import argparse
 
 import claudex.cmd_anal as ca
+import claudex.cmd_rag as cr
 import claudex.cmd_serve as cs
 import claudex.cmd_models as cm
 
@@ -16,6 +17,8 @@ def _dispatch(args):
         cm.cmd_models(args)
     elif args.command == "anal":
         ca.cmd_anal(args)
+    elif args.command == "rag":
+        cr.cmd_rag(args)
 
 
 def main():
@@ -33,6 +36,9 @@ def main():
 
     p_anal = sub.add_parser("anal", help="Analyze debug log")
     p_anal.add_argument("log", help="Path to debug log file")
+
+    p_rag = sub.add_parser("rag", help="Interactive RAG search (stdin -> top-10 chunks)")
+    p_rag.add_argument("config", help="Path to config.json")
 
     args = parser.parse_args()
 
