@@ -175,14 +175,8 @@ class ProxyServer:
 
         block = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
         wrapped = f"<cx:search>\n{block}\n</cx:search>"
-        system = body.get("system")
 
-        if isinstance(system, str):
-            body["system"] = (wrapped + "\n\n" + system) if system else wrapped
-        elif isinstance(system, list):
-            system.insert(0, {"type": "text", "text": wrapped})
-        else:
-            body["system"] = wrapped
+        body.setdefault("messages", []).append({"role": "user", "content": wrapped})
 
         lg.log(wrapped, sid=sid)
         lg.debug_log(self.config, "SEARCH", {"query": last_text, "results": hits}, req_id=req_id)
