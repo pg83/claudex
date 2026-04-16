@@ -262,11 +262,11 @@ class WhooshEngine:
         return 1
 
     def search(self, query: str) -> list[dict]:
-        from whoosh.qparser import QueryParser
+        from whoosh.qparser import QueryParser, OrGroup
         from whoosh.highlight import ContextFragmenter, UppercaseFormatter
 
         with self._ix.searcher() as s:
-            q = QueryParser("body", self._schema).parse(query)
+            q = QueryParser("body", self._schema, group=OrGroup.factory(0.9)).parse(query)
             hits = s.search(q, limit=self.max_results)
             hits.fragmenter = ContextFragmenter(maxchars=self.snippet_chars, surround=self.snippet_chars // 4)
             hits.formatter = UppercaseFormatter()
