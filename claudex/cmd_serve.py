@@ -1123,7 +1123,8 @@ class ProxyServer:
         return compressed
 
     def enrich_with_rag(self, body: dict, req_id: str):
-        chunk_size = self.config.get("rag_chunk_size", 2000)
+        rag_cfg = self.config.get("rag", {})
+        chunk_size = rag_cfg.get("chunk_size", 2000)
 
         for msg in body.get("messages", []):
             text = extract_msg_text(msg)
@@ -1136,7 +1137,7 @@ class ProxyServer:
         if not last_text:
             return
 
-        rag_results = self.rag.search(last_text, self.config.get("rag_max_results", 3))
+        rag_results = self.rag.search(last_text, rag_cfg.get("max_results", 3))
 
         if not rag_results:
             return
@@ -1316,15 +1317,21 @@ def cmd_serve(args: argparse.Namespace):
         info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
 
     rag = None
-    rag_dirs = config.get("rag_dirs", [])
+    rag_cfg = config.get("rag", {})
+    rag_dirs = rag_cfg.get("dirs", [])
 
     if rag_dirs:
-        exts = config.get("rag_extensions")
-        chunk_size = config.get("rag_chunk_size", 2000)
         dirs = [os.path.expanduser(d) for d in rag_dirs]
-        rag_db = config.get("rag_db", "~/.cache/claudex/rag.db")
-        rag = rag_mod.RAG(rag_db, dirs, set(exts) if exts else None, chunk_size)
-        info(f"RAG: {len(rag.cache)} chunks from {', '.join(dirs)} (db: {rag_db})")
+        exts = rag_cfg.get("extensions")
+        chunk_size = rag_cfg.get("chunk_size", 2000)
+        db_path = rag_cfg.get("db", "~/.cache/claudex/rag.db")
+
+        embed_url = rag_cfg.get("embed_url") or rag_mod.OLLAMA_URL
+        embed_model = rag_cfg.get("embed_model") or rag_mod.OLLAMA_MODEL
+        embedder = rag_mod.make_ollama_embedder(embed_url, embed_model)
+
+        rag = rag_mod.RAG(db_path, dirs, set(exts) if exts else None, chunk_size, embedder)
+        info(f"RAG: {len(rag.cache)} chunks from {', '.join(dirs)} (db: {db_path}, embed: {embed_model} @ {embed_url})")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")

@@ -21,19 +21,20 @@ DEFAULT_EXTENSIONS = {
 OLLAMA_URL = "http://localhost:11434/api/embed"
 OLLAMA_MODEL = "nomic-embed-text"
 
-_ollama_client: httpx.Client = None  # type: ignore[assignment]
+
+def make_ollama_embedder(url: str = OLLAMA_URL, model: str = OLLAMA_MODEL) -> Callable[[str], list[float]]:
+    client = httpx.Client(timeout=60.0)
+
+    def embed(text: str) -> list[float]:
+        resp = client.post(url, json={"model": model, "input": text})
+        resp.raise_for_status()
+
+        return resp.json()["embeddings"][0]
+
+    return embed
 
 
-def default_embedder(text: str) -> list[float]:
-    global _ollama_client
-
-    if _ollama_client is None:
-        _ollama_client = httpx.Client(timeout=60.0)
-
-    resp = _ollama_client.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "input": text})
-    resp.raise_for_status()
-
-    return resp.json()["embeddings"][0]
+default_embedder = make_ollama_embedder()
 
 
 def split_text(text: str, size: int) -> list[str]:

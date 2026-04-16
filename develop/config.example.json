@@ -9,7 +9,12 @@
     }
   },
 
-  "rag_dir": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-  "rag_max_results": 4,
-  "rag_chunk_size": 2000
+  "rag": {
+    "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
+    "max_results": 4,
+    "chunk_size": 2000,
+    "db": "~/.cache/claudex/rag.db",
+    "embed_url": "http://localhost:11434/api/embed",
+    "embed_model": "nomic-embed-text"
+  }
 }

@@ -61,18 +61,21 @@ def load_config(path: str) -> dict:
         config["host"] = "127.0.0.1"
         config["port"] = int(listen)
 
-    raw = cfg.get("rag_dir")
+    rag_cfg = cfg.get("rag", {})
+    raw_dirs = rag_cfg.get("dirs", [])
 
-    if isinstance(raw, str):
-        config["rag_dirs"] = [raw]
-    elif isinstance(raw, list):
-        config["rag_dirs"] = raw
-    else:
-        config["rag_dirs"] = []
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
 
-    config["rag_extensions"] = cfg.get("rag_extensions")
-    config["rag_max_results"] = cfg.get("rag_max_results", 3)
-    config["rag_chunk_size"] = cfg.get("rag_chunk_size", 2000)
+    config["rag"] = {
+        "dirs": raw_dirs,
+        "extensions": rag_cfg.get("extensions"),
+        "max_results": rag_cfg.get("max_results", 3),
+        "chunk_size": rag_cfg.get("chunk_size", 2000),
+        "db": rag_cfg.get("db", "~/.cache/claudex/rag.db"),
+        "embed_url": _expand_env(rag_cfg.get("embed_url")),
+        "embed_model": _expand_env(rag_cfg.get("embed_model")),
+    }
 
     endpoints: dict = {}
 
