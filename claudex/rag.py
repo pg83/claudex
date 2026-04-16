@@ -141,7 +141,7 @@ class RAG:
         scored = [(cosine(qvec, vec), sha) for sha, vec in self.cache.items()]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        top = scored[:limit]
+        top = scored[1:limit + 1]
 
         if not top:
             return []
