@@ -10,11 +10,19 @@
   },
 
   "rag": {
-    "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-    "max_results": 4,
     "chunk_size": 2000,
-    "db": "~/.cache/claudex/rag.db",
     "embed_url": "http://10.0.0.227:11434/api/embed",
-    "embed_model": "nomic-embed-text"
+    "embed_model": "nomic-embed-text",
+
+    "files": {
+      "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
+      "max_results": 3,
+      "db": "~/.cache/claudex/rag_files.db"
+    },
+
+    "conversations": {
+      "max_results": 2,
+      "db": "~/.cache/claudex/rag_conv.db"
+    }
   }
 }

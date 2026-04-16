@@ -76,6 +76,7 @@ def cosine(a: list[float], b: list[float]) -> float:
 class RAG:
     def __init__(self, cfg: dict, embedder: Callable[[str], list[float]] = None):
         self.chunk_size = cfg.get("chunk_size", 2000)
+        self.max_results = cfg.get("max_results", 3)
 
         if embedder is None:
             url = cfg.get("embed_url") or OLLAMA_URL
@@ -164,15 +165,18 @@ class RAG:
 
         return added
 
-    def search(self, query: str, limit: int = 3) -> list[dict]:
+    def search(self, query: str, limit: int = None) -> list[dict]:
         if not self.cache:
             return []
+
+        if limit is None:
+            limit = self.max_results
 
         qvec = self.embedder(query)
         scored = [(cosine(qvec, vec), sha) for sha, vec in self.cache.items()]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        top = scored[1:limit + 1]
+        top = scored[:limit]
 
         if not top:
             return []
@@ -200,3 +204,40 @@ class RAG:
             for sim, sha in top
             if sha in data_by_sha
         ]
+
+
+class MultiRAG:
+    def __init__(self, cfg: dict):
+        parent = {k: v for k, v in cfg.items() if k not in ("files", "conversations")}
+        files_cfg = {**parent, **cfg.get("files", {})}
+        conv_cfg = {**parent, **cfg.get("conversations", {})}
+
+        self.files = RAG(files_cfg)
+        self.conversations = RAG(conv_cfg)
+
+    def add(self, path: str, text: str) -> int:
+        if path.startswith("conversation/"):
+            return self.conversations.add(path, text)
+
+        return self.files.add(path, text)
+
+    def search(self, query: str, limit: int = None) -> list[dict]:
+        f_limit = (limit + 1) if limit else (self.files.max_results + 1)
+        c_limit = (limit + 1) if limit else (self.conversations.max_results + 1)
+
+        f_hits = [{**h, "source": "files"} for h in self.files.search(query, f_limit)]
+        c_hits = [{**h, "source": "conversations"} for h in self.conversations.search(query, c_limit)]
+
+        merged = sorted(f_hits + c_hits, key=lambda r: -r["rank"])
+
+        if merged:
+            merged = merged[1:]
+
+        if limit is not None:
+            merged = merged[:limit]
+
+        return merged
+
+    @property
+    def cache(self) -> dict:
+        return {**self.files.cache, **self.conversations.cache}

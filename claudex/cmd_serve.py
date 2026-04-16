@@ -168,7 +168,7 @@ class ProxyServer:
         if not last_text:
             return
 
-        rag_results = self.rag.search(last_text, self.config.get("rag", {}).get("max_results", 3))
+        rag_results = self.rag.search(last_text)
 
         if not rag_results:
             return
@@ -385,9 +385,10 @@ def cmd_serve(args: argparse.Namespace):
     rag = None
     rag_cfg = config.get("rag", {})
 
-    if rag_cfg.get("dirs"):
-        rag = rag_mod.RAG(rag_cfg)
-        info(f"RAG: {len(rag.cache)} chunks (db: {rag.db_path})")
+    if rag_cfg:
+        rag = rag_mod.MultiRAG(rag_cfg)
+        info(f"RAG files: {len(rag.files.cache)} chunks (db: {rag.files.db_path})")
+        info(f"RAG conversations: {len(rag.conversations.cache)} chunks (db: {rag.conversations.db_path})")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
