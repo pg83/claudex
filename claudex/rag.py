@@ -1,8 +1,13 @@
-"""Minimal FTS5-based RAG: index a directory, search by text."""
-
 import os
-import sqlite3
 import sys
+import json
+import math
+import pickle
+import hashlib
+import sqlite3
+
+from typing import Callable
+
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox", ".mypy_cache"}
 DEFAULT_EXTENSIONS = {
@@ -12,83 +17,139 @@ DEFAULT_EXTENSIONS = {
 }
 
 
-class RAG:
-    def __init__(self, directories, extensions: set = None, chunk_size: int = 2000):
-        if isinstance(directories, str):
-            directories = [directories]
-        self.db = sqlite3.connect(":memory:")
-        self.db.execute("CREATE VIRTUAL TABLE chunks USING fts5(path, idx, content)")
-        extensions = extensions or DEFAULT_EXTENSIONS
-        n_files = 0
-        n_chunks = 0
-        for directory in directories:
-            for root, dirs, files in os.walk(directory):
-                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                for fname in files:
-                    if os.path.splitext(fname)[1] not in extensions:
-                        continue
-                    fpath = os.path.join(root, fname)
-                    rel = os.path.abspath(fpath)
-                    try:
-                        text = open(fpath, errors="replace").read()
-                    except (OSError, UnicodeDecodeError):
-                        continue
-                    n_files += 1
-                    file_chunks = _split(text, chunk_size)
-                    for i, chunk in enumerate(file_chunks):
-                        self.db.execute("INSERT INTO chunks VALUES (?, ?, ?)", (rel, str(i), chunk))
-                        n_chunks += 1
-                    print(f"  rag: {rel} ({len(file_chunks)} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
-        self.db.commit()
-        self.n_files = n_files
-        self.n_chunks = n_chunks
-
-    def add(self, path: str, text: str, chunk_size: int = 2000):
-        """Add text to the index at runtime."""
-        for i, chunk in enumerate(_split(text, chunk_size)):
-            self.db.execute("INSERT INTO chunks VALUES (?, ?, ?)", (path, str(i), chunk))
-        self.db.commit()
-
-    def search(self, query: str, limit: int = 3) -> list[dict]:
-        """Search indexed chunks. Returns [{"path", "idx", "content", "rank"}]."""
-        words = _tokenize(query)
-        if not words:
-            return []
-        fts_query = " OR ".join(words)
-        rows = self.db.execute(
-            "SELECT path, idx, content, rank FROM chunks WHERE content MATCH ? ORDER BY rank LIMIT ?",
-            (fts_query, limit),
-        ).fetchall()
-        return [{"path": r[0], "idx": int(r[1]), "content": r[2], "rank": r[3]} for r in rows]
+def default_embedder(text: str) -> list[float]:
+    return [1.0]
 
 
-def _split(text: str, size: int) -> list[str]:
-    """Split text into chunks of ~size chars, breaking at line boundaries."""
+def split_text(text: str, size: int) -> list[str]:
     chunks = []
     lines = text.split("\n")
     buf = []
     buf_len = 0
+
     for line in lines:
         if buf_len + len(line) + 1 > size and buf:
             chunks.append("\n".join(buf))
             buf = []
             buf_len = 0
+
         buf.append(line)
         buf_len += len(line) + 1
+
     if buf:
         chunks.append("\n".join(buf))
+
     return chunks
 
 
-def _tokenize(text: str) -> list[str]:
-    """Extract words suitable for FTS5 MATCH query."""
-    import re
-    words = re.findall(r"[a-zA-Z_]\w{2,}", text)
-    seen = set()
-    result = []
-    for w in words:
-        wl = w.lower()
-        if wl not in seen:
-            seen.add(wl)
-            result.append(wl)
-    return result[:20]
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+class RAG:
+    def __init__(
+        self,
+        db_path: str,
+        directories: list = None,
+        extensions: set = None,
+        chunk_size: int = 2000,
+        embedder: Callable[[str], list[float]] = default_embedder,
+    ):
+        self.embedder = embedder
+        self.cache: dict[str, tuple[list[float], dict]] = {}
+
+        db_path = os.path.expanduser(db_path)
+        parent = os.path.dirname(db_path)
+
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        self.db = sqlite3.connect(db_path)
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, chunk TEXT, embedding BLOB)"
+        )
+
+        for sha, chunk_json, emb_blob in self.db.execute("SELECT sha, chunk, embedding FROM chunks"):
+            self.cache[sha] = (pickle.loads(emb_blob), json.loads(chunk_json))
+
+        if directories:
+            if isinstance(directories, str):
+                directories = [directories]
+
+            extensions = extensions or DEFAULT_EXTENSIONS
+
+            for directory in directories:
+                for root, dirs, files in os.walk(directory):
+                    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+                    for fname in files:
+                        if os.path.splitext(fname)[1] not in extensions:
+                            continue
+
+                        fpath = os.path.join(root, fname)
+                        rel = os.path.abspath(fpath)
+
+                        try:
+                            text = open(fpath, errors="replace").read()
+                        except (OSError, UnicodeDecodeError):
+                            continue
+
+                        added = self.add(rel, text, chunk_size)
+                        print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
+
+        self.n_chunks = len(self.cache)
+        self.n_files = len({doc["path"] for _, doc in self.cache.values()})
+
+    def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
+        added = 0
+
+        for chunk in split_text(text, chunk_size):
+            doc = {"path": path, "data": chunk}
+            chunk_json = json.dumps(doc, ensure_ascii=False, sort_keys=True)
+            sha = hashlib.sha256(chunk_json.encode()).hexdigest()
+
+            if sha in self.cache:
+                continue
+
+            vec = self.embedder(chunk)
+            self.db.execute(
+                "INSERT INTO chunks (sha, chunk, embedding) VALUES (?, ?, ?)",
+                (sha, chunk_json, pickle.dumps(vec)),
+            )
+            self.cache[sha] = (vec, doc)
+            added += 1
+
+        if added:
+            self.db.commit()
+
+        return added
+
+    def search(self, query: str, limit: int = 3) -> list[dict]:
+        if not self.cache:
+            return []
+
+        qvec = self.embedder(query)
+        scored = []
+
+        for vec, doc in self.cache.values():
+            sim = cosine(qvec, vec)
+            scored.append((sim, doc))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        return [
+            {"path": doc["path"], "data": doc["data"], "rank": sim}
+            for sim, doc in scored[:limit]
+        ]

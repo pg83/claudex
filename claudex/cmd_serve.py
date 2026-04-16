@@ -1133,7 +1133,7 @@ class ProxyServer:
             return
 
         rag_block = "\n".join(
-            f"File: {r['path']} (chunk {r['idx']})\n---\n{r['content']}\n---"
+            f"File: {r['path']}\n---\n{r['data']}\n---"
             for r in rag_results
         )
 
@@ -1151,7 +1151,7 @@ class ProxyServer:
 
                 break
 
-        hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
+        hits = " | ".join(f"{r['path']}({r['rank']:.2f})" for r in rag_results)
         lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
         lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
@@ -1313,8 +1313,9 @@ def cmd_serve(args: argparse.Namespace):
         exts = config.get("rag_extensions")
         chunk_size = config.get("rag_chunk_size", 2000)
         dirs = [os.path.expanduser(d) for d in rag_dirs]
-        rag = rag_mod.RAG(dirs, set(exts) if exts else None, chunk_size)
-        info(f"RAG: {rag.n_files} files, {rag.n_chunks} chunks from {', '.join(dirs)}")
+        rag_db = config.get("rag_db", "~/.cache/claudex/rag.db")
+        rag = rag_mod.RAG(rag_db, dirs, set(exts) if exts else None, chunk_size)
+        info(f"RAG: {rag.n_files} files, {rag.n_chunks} chunks from {', '.join(dirs)} (db: {rag_db})")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
