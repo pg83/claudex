@@ -109,8 +109,6 @@ class RAG:
                         added = self.add(rel, text, chunk_size)
                         print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
 
-        self.n_chunks = len(self.cache)
-
     def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
         added = 0
 

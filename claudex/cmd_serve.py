@@ -1315,7 +1315,7 @@ def cmd_serve(args: argparse.Namespace):
         dirs = [os.path.expanduser(d) for d in rag_dirs]
         rag_db = config.get("rag_db", "~/.cache/claudex/rag.db")
         rag = rag_mod.RAG(rag_db, dirs, set(exts) if exts else None, chunk_size)
-        info(f"RAG: {rag.n_chunks} chunks from {', '.join(dirs)} (db: {rag_db})")
+        info(f"RAG: {len(rag.cache)} chunks from {', '.join(dirs)} (db: {rag_db})")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
