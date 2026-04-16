@@ -917,7 +917,7 @@ class ProxyServer:
 
             return data
 
-    async def call_anthropic(self, body: dict, base_url: str, api_key: str, client_headers=None, proxy: Optional[str] = None) -> dict:
+    def anthropic_headers(self, api_key: str, client_headers) -> dict:
         headers = {"content-type": "application/json"}
 
         if client_headers:
@@ -942,11 +942,58 @@ class ProxyServer:
 
         headers.setdefault("anthropic-version", "2023-06-01")
 
+        return headers
+
+    async def call_anthropic(self, body: dict, base_url: str, api_key: str, client_headers=None, proxy: Optional[str] = None) -> dict:
+        headers = self.anthropic_headers(api_key, client_headers)
         url = messages_url(base_url)
         resp = await self.client(proxy).post(url, json=body, headers=headers)
         resp.raise_for_status()
 
         return resp.json()
+
+    async def call_anthropic_stream(self, body: dict, base_url: str, api_key: str, client_headers=None, proxy: Optional[str] = None) -> httpx.Response:
+        headers = self.anthropic_headers(api_key, client_headers)
+        url = messages_url(base_url)
+        http = self.client(proxy)
+
+        req = http.build_request("POST", url, json=body, headers=headers)
+        resp = await http.send(req, stream=True)
+
+        if resp.status_code != 200:
+            await resp.aread()
+
+            await resp.aclose()
+
+            raise httpx.HTTPStatusError(
+                f"Anthropic returned {resp.status_code}",
+                request=req,
+                response=resp,
+            )
+
+        return resp
+
+    async def passthrough_sse(self, resp: httpx.Response, req_id: str) -> AsyncIterator[str]:
+        buffer = b""
+
+        try:
+            async for chunk in resp.aiter_bytes():
+                buffer += chunk
+
+                while b"\n\n" in buffer:
+                    event_bytes, buffer = buffer.split(b"\n\n", 1)
+                    event_str = event_bytes.decode("utf-8", errors="replace") + "\n\n"
+                    lg.debug_sse(self.config, "out", event_str, req_id=req_id)
+
+                    yield event_str
+
+            if buffer:
+                tail = buffer.decode("utf-8", errors="replace")
+
+                if tail.strip():
+                    yield tail
+        finally:
+            await resp.aclose()
 
     async def call_compress_llm(self, messages: list, req_id: str = "") -> str:
         ep = cx.resolve_endpoint(self.config, "compress")
@@ -1196,6 +1243,24 @@ class ProxyServer:
             self.enrich_with_rag(body, req_id)
 
         try:
+            if ep.get("protocol") == "anthropic" and is_stream:
+                upstream_body = dict(body)
+                upstream_body["messages"] = list(body.get("messages", []))
+                upstream_body["model"] = ep["model"]
+                upstream_body["stream"] = True
+
+                resp = await self.call_anthropic_stream(
+                    upstream_body,
+                    base_url=ep["base_url"], api_key=ep["api_key"],
+                    client_headers=request.headers, proxy=ep.get("proxy"),
+                )
+
+                return StreamingResponse(
+                    self.passthrough_sse(resp, req_id),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
+
             if ep.get("protocol") == "anthropic":
                 upstream_body = dict(body)
                 upstream_body["messages"] = list(body.get("messages", []))
