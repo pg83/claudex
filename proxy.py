@@ -232,9 +232,8 @@ def log(msg: str, req_id: str = ""):
     print(f"{prefix}{msg}", file=sys.stderr, flush=True)
 
 
-def _extract_msg_text(msg: dict) -> str:
-    """Extract all text content from a message."""
-    content = msg.get("content", "")
+def _extract_text_content(content) -> str:
+    """Extract text from content (string or list of blocks)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -243,17 +242,16 @@ def _extract_msg_text(msg: dict) -> str:
     return ""
 
 
+def _extract_msg_text(msg: dict) -> str:
+    """Extract all text content from a message."""
+    return _extract_text_content(msg.get("content", ""))
+
+
 def _extract_last_user_text(messages: list) -> str:
     """Get text from the last user message."""
     for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            texts = [b.get("text", "") for b in content if b.get("type") == "text"]
-            return " ".join(texts)
+        if msg.get("role") == "user":
+            return _extract_text_content(msg.get("content", ""))
     return ""
 
 
@@ -969,13 +967,11 @@ def serialize_messages(messages: list) -> str:
     return json.dumps(messages, ensure_ascii=False)
 
 
-async def call_compress_llm(messages: list, req_id: str = "") -> str:
-    """Send messages to the compression model and return summary text."""
-    ep = resolve_endpoint("compress")
+def _build_compress_body(messages: list, model: str) -> dict:
+    """Build the request body for context compression LLM call."""
     serialized = serialize_messages(messages)
-
-    compress_body = {
-        "model": ep["model"],
+    return {
+        "model": model,
         "messages": [
             {"role": "user", "content": f"<conversation>\n{serialized}\n</conversation>"},
             {"role": "assistant", "content": "I've read the conversation log. What should I do with it?"},
@@ -987,6 +983,11 @@ async def call_compress_llm(messages: list, req_id: str = "") -> str:
         "full": messages,
     }
 
+
+async def call_compress_llm(messages: list, req_id: str = "") -> str:
+    """Send messages to the compression model and return summary text."""
+    ep = resolve_endpoint("compress")
+    compress_body = _build_compress_body(messages, ep["model"])
     debug_log("COMPRESS_REQ", compress_body, req_id=req_id)
 
     headers = {
@@ -1250,6 +1251,31 @@ async def create_message(request: Request):
         return error_response(500, "api_error", str(e))
 
 
+def _count_content_chars(content) -> int:
+    """Count characters in message content (string or list of blocks)."""
+    if isinstance(content, str):
+        return len(content)
+
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            btype = block.get("type", "")
+            if btype == "text":
+                total += len(block.get("text", ""))
+            elif btype == "tool_result":
+                sub = block.get("content", "")
+                if isinstance(sub, str):
+                    total += len(sub)
+                elif isinstance(sub, list):
+                    for sb in sub:
+                        total += len(sb.get("text", ""))
+            elif btype == "tool_use":
+                total += len(json.dumps(block.get("input", {})))
+        return total
+
+    return 0
+
+
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     try:
@@ -1257,27 +1283,10 @@ async def count_tokens(request: Request):
     except Exception:
         return JSONResponse(content={"input_tokens": 0})
 
-    total_chars = 0
-    total_chars += len(extract_system_text(body.get("system")))
+    total_chars = len(extract_system_text(body.get("system")))
 
     for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                btype = block.get("type", "")
-                if btype == "text":
-                    total_chars += len(block.get("text", ""))
-                elif btype == "tool_result":
-                    sub = block.get("content", "")
-                    if isinstance(sub, str):
-                        total_chars += len(sub)
-                    elif isinstance(sub, list):
-                        for sb in sub:
-                            total_chars += len(sb.get("text", ""))
-                elif btype == "tool_use":
-                    total_chars += len(json.dumps(block.get("input", {})))
+        total_chars += _count_content_chars(msg.get("content", ""))
 
     if "tools" in body:
         total_chars += len(json.dumps(body["tools"]))
