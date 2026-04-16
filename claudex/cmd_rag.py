@@ -6,6 +6,19 @@ import claudex.common as cx
 import claudex.rag as rag_mod
 
 
+RESET = "\033[0m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+YELLOW = "\033[33m"
+
+
+def color_path(path: str) -> str:
+    if path.startswith("conversation/"):
+        return f"{YELLOW}{path}{RESET}"
+
+    return f"{CYAN}{path}{RESET}"
+
+
 def cmd_rag(args: argparse.Namespace):
     config = cx.load_config(args.config)
     rag_cfg = config.get("rag", {})
@@ -34,9 +47,9 @@ def cmd_rag(args: argparse.Namespace):
         hits = rag.search(query, 10)
 
         for h in hits:
-            paths = ", ".join(h["paths"])
-            print(f"[{h['rank']:.3f}] {paths}")
+            paths = ", ".join(color_path(p) for p in h["paths"])
+            print(f"{DIM}[{h['rank']:.3f}]{RESET} {paths}")
             print(h["data"])
-            print("---")
+            print(f"{DIM}---{RESET}")
 
         print("> ", end="", file=sys.stderr, flush=True)
