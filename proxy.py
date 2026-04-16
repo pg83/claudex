@@ -1303,14 +1303,22 @@ def cmd_serve(args: argparse.Namespace):
 
 
 def cmd_models(args: argparse.Namespace):
-    """List models available at the first endpoint."""
-    load_config(args.config)
-    if not ENDPOINTS:
-        sys.exit("No endpoints configured")
+    """List models available at an endpoint."""
+    if args.base_url:
+        base_url = args.base_url
+        api_key = _expand_env(args.api_key or "")
+    elif args.config:
+        load_config(args.config)
+        if not ENDPOINTS:
+            sys.exit("No endpoints configured")
+        ep = next(iter(ENDPOINTS.values()))
+        base_url = ep["base_url"]
+        api_key = _expand_env(args.api_key) if args.api_key else ep["api_key"]
+    else:
+        sys.exit("Provide either config or --base-url")
 
-    ep = next(iter(ENDPOINTS.values()))
-    url = _strip_chat_suffix(ep["base_url"]) + "/models"
-    headers = {"Authorization": f"Bearer {ep['api_key']}"}
+    url = _strip_chat_suffix(base_url) + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
 
     print(f"Fetching models from {url} ...\n")
     try:
@@ -1363,8 +1371,10 @@ def main():
     p_serve.add_argument("--debug", action="store_true", help="Enable debug logging")
     p_serve.add_argument("--port", type=int, default=0, help="Override listen port")
 
-    p_models = sub.add_parser("models", help="List models at first configured endpoint")
-    p_models.add_argument("config", help="Path to config.json")
+    p_models = sub.add_parser("models", help="List models at an endpoint")
+    p_models.add_argument("config", nargs="?", help="Path to config.json (uses first endpoint)")
+    p_models.add_argument("--base-url", help="Base URL (e.g. https://api.openai.com/v1)")
+    p_models.add_argument("--api-key", help="API key (or $ENV_VAR)")
 
     p_anal = sub.add_parser("anal", help="Analyze debug log")
     p_anal.add_argument("log", help="Path to debug log file")

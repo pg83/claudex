@@ -3,15 +3,19 @@
   "listen": "127.0.0.1:18080",
 
   "endpoints": {
-    "compress1": {
+    "opus2": {
       "base_url": "https://api.eliza.yandex.net/internal/glm-latest/v1",
+      "model": "/genesis/model"
+    },
+    "opus": {
+      "base_url": "https://api.eliza.yandex.net/internal/glm-4-7/v1",
       "model": "/genesis/model"
     },
     "compress2": {
       "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
       "model": "google/gemini-2.5-flash-lite"
     },
-    "opus": {
+    "opus1": {
       "base_url": "https://api.eliza.yandex.net/openrouter/v1/chat/completions",
       "model": "openai/gpt-4.1-nano"
     }
