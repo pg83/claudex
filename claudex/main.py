@@ -7,9 +7,9 @@ import signal
 import argparse
 
 import claudex.cmd_anal as ca
-import claudex.cmd_rag as cr
 import claudex.cmd_serve as cs
 import claudex.cmd_models as cm
+import claudex.cmd_search as csh
 
 
 signal.signal(signal.SIGINT, lambda *_: os._exit(130))
@@ -22,8 +22,8 @@ def _dispatch(args):
         cm.cmd_models(args)
     elif args.command == "anal":
         ca.cmd_anal(args)
-    elif args.command == "rag":
-        cr.cmd_rag(args)
+    elif args.command == "search":
+        csh.cmd_search(args)
 
 
 def main():
@@ -42,8 +42,8 @@ def main():
     p_anal = sub.add_parser("anal", help="Analyze debug log")
     p_anal.add_argument("log", help="Path to debug log file")
 
-    p_rag = sub.add_parser("rag", help="Interactive RAG search (stdin -> top-10 chunks)")
-    p_rag.add_argument("config", help="Path to config.json")
+    p_search = sub.add_parser("search", help="Interactive search (stdin -> top-10 hits across engines)")
+    p_search.add_argument("config", help="Path to config.json")
 
     args = parser.parse_args()
 

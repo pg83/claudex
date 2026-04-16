@@ -61,7 +61,7 @@ def load_config(path: str) -> dict:
         config["host"] = "127.0.0.1"
         config["port"] = int(listen)
 
-    config["rag"] = cfg.get("rag", {})
+    config["search"] = cfg.get("search", {})
 
     endpoints: dict = {}
 

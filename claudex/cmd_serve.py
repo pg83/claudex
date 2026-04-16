@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex.log as lg
 import claudex.common as cx
-import claudex.rag as rag_mod
+import claudex.search as search_mod
 import claudex.proto_common as pc
 import claudex.upper_openai as uo
 import claudex.upper_anthropic as ua
@@ -32,9 +32,9 @@ import claudex.upper_anthropic as ua
 
 
 class ProxyServer:
-    def __init__(self, config: dict, rag: Optional[rag_mod.RAG] = None):
+    def __init__(self, config: dict, search: Optional["search_mod.Search"] = None):
         self.config = config
-        self.rag = rag
+        self.search = search
         self.clients: dict[Optional[str], httpx.AsyncClient] = {}
         self.app = Starlette(
             lifespan=self.lifespan,
@@ -156,30 +156,30 @@ class ProxyServer:
 
     # ----- RAG enrichment -----
 
-    def enrich_with_rag(self, body: dict, sid: str, req_id: str):
+    def enrich_with_search(self, body: dict, sid: str, req_id: str):
         for msg in body.get("messages", []):
             text = pc.extract_msg_text(msg)
 
             if text:
-                self.rag.add(f"conversation/{sid}/{msg['role']}", text)
+                self.search.add(f"conversation/{sid}/{msg['role']}", text)
 
         last_text = pc.extract_last_user_text(body.get("messages", []))
 
         if not last_text:
             return
 
-        rag_results = self.rag.search(last_text)
+        hits = self.search.search(last_text)
 
-        if not rag_results:
+        if not hits:
             return
 
-        rag_block = "\n".join(
-            f"Files: {', '.join(r['paths'])}\n---\n{r['data']}\n---"
-            for r in rag_results
+        block = "\n".join(
+            f"[{h['engine']}] {', '.join(h['paths'])}\n---\n{h['data']}\n---"
+            for h in hits
         )
         messages = body.get("messages", [])
 
-        suffix = f"\n---\n<rag>\n{rag_block}\n</rag>"
+        suffix = f"\n---\n<search>\n{block}\n</search>"
 
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -193,7 +193,7 @@ class ProxyServer:
                 break
 
         lg.log(suffix, sid=sid)
-        lg.debug_log(self.config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+        lg.debug_log(self.config, "SEARCH", {"query": last_text, "results": hits}, req_id=req_id)
 
     # ----- HTTP endpoints -----
 
@@ -225,8 +225,8 @@ class ProxyServer:
         if "compress" in self.config["endpoints"] and "messages" in body:
             body["messages"] = await self.compress_context(body["messages"], sid=sid, req_id=req_id)
 
-        if self.rag is not None:
-            self.enrich_with_rag(body, sid, req_id)
+        if self.search is not None:
+            self.enrich_with_search(body, sid, req_id)
 
         body["model"] = ep["model"]
 
@@ -376,13 +376,15 @@ def cmd_serve(args: argparse.Namespace):
     if "compress" in endpoints:
         info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
 
-    rag = None
-    rag_cfg = config.get("rag", {})
+    search = None
+    search_cfg = config.get("search", {})
 
-    if rag_cfg:
-        rag = rag_mod.MultiRAG(rag_cfg)
-        info(f"RAG files: {len(rag.files.cache)} chunks (db: {rag.files.db_path})")
-        info(f"RAG conversations: {len(rag.conversations.cache)} chunks (db: {rag.conversations.db_path})")
+    if search_cfg:
+        search = search_mod.Search(search_cfg)
+
+        for src, engines in search.engines_by_source.items():
+            engines_desc = ", ".join(f"{e.type_name}:{e.size}" for e in engines)
+            info(f"Search {src}: {engines_desc}")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
@@ -391,5 +393,5 @@ def cmd_serve(args: argparse.Namespace):
     info("Usage:")
     info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
 
-    server = ProxyServer(config, rag)
+    server = ProxyServer(config, search)
     server.run()

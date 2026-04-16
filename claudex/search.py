@@ -33,9 +33,6 @@ def make_ollama_embedder(url: str = OLLAMA_URL, model: str = OLLAMA_MODEL) -> Ca
     return embed
 
 
-default_embedder = make_ollama_embedder()
-
-
 def split_text(text: str, size: int) -> list[str]:
     chunks = []
     lines = text.split("\n")
@@ -73,7 +70,37 @@ def cosine(a: list[float], b: list[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
+def walk_files(cfg: dict):
+    dirs = [os.path.expanduser(d) for d in cfg.get("dirs", [])]
+    extensions = set(cfg["extensions"]) if cfg.get("extensions") else DEFAULT_EXTENSIONS
+
+    for directory in dirs:
+        for root, subdirs, files in os.walk(directory):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+
+            for fname in files:
+                if os.path.splitext(fname)[1] not in extensions:
+                    continue
+
+                fpath = os.path.join(root, fname)
+                rel = os.path.abspath(fpath)
+
+                try:
+                    text = open(fpath, errors="replace").read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+
+                yield rel, text
+
+
+# ---------------------------------------------------------------------------
+# RAG engine (sqlite + embedding cosine)
+# ---------------------------------------------------------------------------
+
+
 class RAG:
+    type_name = "rag"
+
     def __init__(self, cfg: dict, embedder: Callable[[str], list[float]] = None):
         self.chunk_size = cfg.get("chunk_size", 2000)
         self.max_results = cfg.get("max_results", 3)
@@ -95,11 +122,6 @@ class RAG:
         self.db_path = db_path
         self.db = sqlite3.connect(db_path)
 
-        cols = [r[1] for r in self.db.execute("PRAGMA table_info(chunks)")]
-
-        if cols and "chunk" in cols and "data" not in cols:
-            self.db.execute("DROP TABLE chunks")
-
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, data TEXT, embedding BLOB)"
         )
@@ -110,27 +132,9 @@ class RAG:
         for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM chunks"):
             self.cache[sha] = pickle.loads(emb_blob)
 
-        dirs = [os.path.expanduser(d) for d in cfg.get("dirs", [])]
-        extensions = set(cfg["extensions"]) if cfg.get("extensions") else DEFAULT_EXTENSIONS
-
-        for directory in dirs:
-            for root, subdirs, files in os.walk(directory):
-                subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-
-                for fname in files:
-                    if os.path.splitext(fname)[1] not in extensions:
-                        continue
-
-                    fpath = os.path.join(root, fname)
-                    rel = os.path.abspath(fpath)
-
-                    try:
-                        text = open(fpath, errors="replace").read()
-                    except (OSError, UnicodeDecodeError):
-                        continue
-
-                    added = self.add(rel, text)
-                    print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
+        for path, text in walk_files(cfg):
+            added = self.add(path, text)
+            print(f"  rag: {path} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
 
     def add(self, path: str, text: str) -> int:
         added = 0
@@ -165,18 +169,15 @@ class RAG:
 
         return added
 
-    def search(self, query: str, limit: int = None) -> list[dict]:
+    def search(self, query: str) -> list[dict]:
         if not self.cache:
             return []
-
-        if limit is None:
-            limit = self.max_results
 
         qvec = self.embedder(query)
         scored = [(cosine(qvec, vec), sha) for sha, vec in self.cache.items()]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        top = scored[:limit]
+        top = scored[:self.max_results]
 
         if not top:
             return []
@@ -205,39 +206,131 @@ class RAG:
             if sha in data_by_sha
         ]
 
+    @property
+    def size(self) -> int:
+        return len(self.cache)
 
-class MultiRAG:
+
+# ---------------------------------------------------------------------------
+# Whoosh engine (BM25 keyword search, in-memory)
+# ---------------------------------------------------------------------------
+
+
+class WhooshEngine:
+    type_name = "whoosh"
+
     def __init__(self, cfg: dict):
-        parent = {k: v for k, v in cfg.items() if k not in ("files", "conversations")}
-        files_cfg = {**parent, **cfg.get("files", {})}
-        conv_cfg = {**parent, **cfg.get("conversations", {})}
+        from whoosh.fields import Schema, TEXT, ID
+        from whoosh.filedb.filestore import RamStorage
 
-        self.files = RAG(files_cfg)
-        self.conversations = RAG(conv_cfg)
+        self.chunk_size = cfg.get("chunk_size", 2000)
+        self.max_results = cfg.get("max_results", 5)
+
+        self._schema = Schema(
+            path=ID(stored=True),
+            body=TEXT(stored=True),
+        )
+        self._ix = RamStorage().create_index(self._schema)
+        self._seen: set[str] = set()
+
+        writer = self._ix.writer()
+
+        for path, text in walk_files(cfg):
+            added = self._index(writer, path, text)
+            print(f"  whoosh: {path} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
+
+        writer.commit()
+
+    def _index(self, writer, path: str, text: str) -> int:
+        added = 0
+
+        for chunk in split_text(text, self.chunk_size):
+            if not chunk.strip():
+                continue
+
+            sha = hashlib.sha256((path + "\0" + chunk).encode()).hexdigest()
+
+            if sha in self._seen:
+                continue
+
+            self._seen.add(sha)
+            writer.add_document(path=path, body=chunk)
+            added += 1
+
+        return added
 
     def add(self, path: str, text: str) -> int:
-        if path.startswith("conversation/"):
-            return self.conversations.add(path, text)
+        writer = self._ix.writer()
+        added = self._index(writer, path, text)
+        writer.commit()
 
-        return self.files.add(path, text)
+        return added
 
-    def search(self, query: str, limit: int = None) -> list[dict]:
-        f_limit = (limit + 1) if limit else (self.files.max_results + 1)
-        c_limit = (limit + 1) if limit else (self.conversations.max_results + 1)
+    def search(self, query: str) -> list[dict]:
+        from whoosh.qparser import QueryParser
 
-        f_hits = [{**h, "source": "files"} for h in self.files.search(query, f_limit)]
-        c_hits = [{**h, "source": "conversations"} for h in self.conversations.search(query, c_limit)]
+        with self._ix.searcher() as s:
+            q = QueryParser("body", self._schema).parse(query)
+            hits = s.search(q, limit=self.max_results)
 
-        merged = sorted(f_hits + c_hits, key=lambda r: -r["rank"])
-
-        if merged:
-            merged = merged[1:]
-
-        if limit is not None:
-            merged = merged[:limit]
-
-        return merged
+            return [
+                {"paths": [h["path"]], "data": h["body"], "rank": h.score}
+                for h in hits
+            ]
 
     @property
-    def cache(self) -> dict:
-        return {**self.files.cache, **self.conversations.cache}
+    def size(self) -> int:
+        return len(self._seen)
+
+
+# ---------------------------------------------------------------------------
+# Search dispatcher
+# ---------------------------------------------------------------------------
+
+
+ENGINES = {
+    "rag": RAG,
+    "whoosh": WhooshEngine,
+}
+
+
+def make_engine(cfg: dict):
+    t = cfg.get("type")
+    cls = ENGINES.get(t)
+
+    if cls is None:
+        raise ValueError(f"unknown search engine type: {t!r}")
+
+    return cls(cfg)
+
+
+class Search:
+    def __init__(self, cfg: dict):
+        self.engines_by_source: dict[str, list] = {}
+
+        for source, engines_cfg in cfg.items():
+            self.engines_by_source[source] = [make_engine(e) for e in engines_cfg]
+
+    def add(self, path: str, text: str):
+        source = "conversation" if path.startswith("conversation/") else "fs"
+
+        for engine in self.engines_by_source.get(source, []):
+            engine.add(path, text)
+
+    def search(self, query: str, limit: int = None) -> list[dict]:
+        hits = []
+
+        for source, engines in self.engines_by_source.items():
+            for engine in engines:
+                for h in engine.search(query):
+                    hits.append({**h, "source": source, "engine": engine.type_name})
+
+        hits.sort(key=lambda r: -r["rank"])
+
+        if hits:
+            hits = hits[1:]
+
+        if limit is not None:
+            hits = hits[:limit]
+
+        return hits
