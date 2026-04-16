@@ -17,9 +17,8 @@ def main():
     p_serve.add_argument("--port", type=int, default=0, help="Override listen port")
 
     p_models = sub.add_parser("models", help="List models at an endpoint")
-    p_models.add_argument("config", nargs="?", help="Path to config.json (uses first endpoint)")
-    p_models.add_argument("--base-url", help="Base URL (e.g. https://api.openai.com/v1)")
-    p_models.add_argument("--api-key", help="API key (or $ENV_VAR)")
+    p_models.add_argument("--base-url", required=True, help="Base URL (e.g. https://api.openai.com/v1)")
+    p_models.add_argument("--api-key", required=True, help="API key (or $ENV_VAR)")
 
     p_anal = sub.add_parser("anal", help="Analyze debug log")
     p_anal.add_argument("log", help="Path to debug log file")

@@ -9,19 +9,8 @@ import claudex.common as cx
 
 
 def cmd_models(args: argparse.Namespace):
-    if args.base_url:
-        base_url = args.base_url
-        api_key = cx._expand_env(args.api_key or "")
-    elif args.config:
-        config = cx.load_config(args.config)
-        endpoints = config.get("endpoints", {})
-        if not endpoints:
-            sys.exit("No endpoints configured")
-        ep = next(iter(endpoints.values()))
-        base_url = ep["base_url"]
-        api_key = cx._expand_env(args.api_key) if args.api_key else ep["api_key"]
-    else:
-        sys.exit("Provide either config or --base-url")
+    base_url = args.base_url
+    api_key = cx._expand_env(args.api_key)
 
     url = cx._strip_chat_suffix(base_url) + "/models"
     headers = {"Authorization": f"Bearer {api_key}"}
