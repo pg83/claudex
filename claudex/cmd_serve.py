@@ -150,21 +150,18 @@ class ProxyServer:
     # ----- RAG enrichment -----
 
     def enrich_with_rag(self, body: dict, req_id: str):
-        rag_cfg = self.config.get("rag", {})
-        chunk_size = rag_cfg.get("chunk_size", 2000)
-
         for msg in body.get("messages", []):
             text = pc.extract_msg_text(msg)
 
             if text:
-                self.rag.add(f"conversation/{req_id}/{msg['role']}", text, chunk_size)
+                self.rag.add(f"conversation/{req_id}/{msg['role']}", text)
 
         last_text = pc.extract_last_user_text(body.get("messages", []))
 
         if not last_text:
             return
 
-        rag_results = self.rag.search(last_text, rag_cfg.get("max_results", 3))
+        rag_results = self.rag.search(last_text, self.config.get("rag", {}).get("max_results", 3))
 
         if not rag_results:
             return
@@ -381,20 +378,10 @@ def cmd_serve(args: argparse.Namespace):
 
     rag = None
     rag_cfg = config.get("rag", {})
-    rag_dirs = rag_cfg.get("dirs", [])
 
-    if rag_dirs:
-        dirs = [os.path.expanduser(d) for d in rag_dirs]
-        exts = rag_cfg.get("extensions")
-        chunk_size = rag_cfg.get("chunk_size", 2000)
-        db_path = rag_cfg.get("db", "~/.cache/claudex/rag.db")
-
-        embed_url = rag_cfg.get("embed_url") or rag_mod.OLLAMA_URL
-        embed_model = rag_cfg.get("embed_model") or rag_mod.OLLAMA_MODEL
-        embedder = rag_mod.make_ollama_embedder(embed_url, embed_model)
-
-        rag = rag_mod.RAG(db_path, dirs, set(exts) if exts else None, chunk_size, embedder)
-        info(f"RAG: {len(rag.cache)} chunks from {', '.join(dirs)} (db: {db_path}, embed: {embed_model} @ {embed_url})")
+    if rag_cfg.get("dirs"):
+        rag = rag_mod.RAG(rag_cfg)
+        info(f"RAG: {len(rag.cache)} chunks (db: {rag.db_path})")
 
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")

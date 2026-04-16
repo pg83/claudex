@@ -74,23 +74,24 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 class RAG:
-    def __init__(
-        self,
-        db_path: str,
-        directories: list = None,
-        extensions: set = None,
-        chunk_size: int = 2000,
-        embedder: Callable[[str], list[float]] = default_embedder,
-    ):
+    def __init__(self, cfg: dict, embedder: Callable[[str], list[float]] = None):
+        self.chunk_size = cfg.get("chunk_size", 2000)
+
+        if embedder is None:
+            url = cfg.get("embed_url") or OLLAMA_URL
+            model = cfg.get("embed_model") or OLLAMA_MODEL
+            embedder = make_ollama_embedder(url, model)
+
         self.embedder = embedder
         self.cache: dict[str, list[float]] = {}
 
-        db_path = os.path.expanduser(db_path)
+        db_path = os.path.expanduser(cfg.get("db", "~/.cache/claudex/rag.db"))
         parent = os.path.dirname(db_path)
 
         if parent:
             os.makedirs(parent, exist_ok=True)
 
+        self.db_path = db_path
         self.db = sqlite3.connect(db_path)
 
         cols = [r[1] for r in self.db.execute("PRAGMA table_info(chunks)")]
@@ -108,36 +109,33 @@ class RAG:
         for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM chunks"):
             self.cache[sha] = pickle.loads(emb_blob)
 
-        if directories:
-            if isinstance(directories, str):
-                directories = [directories]
+        dirs = [os.path.expanduser(d) for d in cfg.get("dirs", [])]
+        extensions = set(cfg["extensions"]) if cfg.get("extensions") else DEFAULT_EXTENSIONS
 
-            extensions = extensions or DEFAULT_EXTENSIONS
+        for directory in dirs:
+            for root, subdirs, files in os.walk(directory):
+                subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
 
-            for directory in directories:
-                for root, dirs, files in os.walk(directory):
-                    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                for fname in files:
+                    if os.path.splitext(fname)[1] not in extensions:
+                        continue
 
-                    for fname in files:
-                        if os.path.splitext(fname)[1] not in extensions:
-                            continue
+                    fpath = os.path.join(root, fname)
+                    rel = os.path.abspath(fpath)
 
-                        fpath = os.path.join(root, fname)
-                        rel = os.path.abspath(fpath)
+                    try:
+                        text = open(fpath, errors="replace").read()
+                    except (OSError, UnicodeDecodeError):
+                        continue
 
-                        try:
-                            text = open(fpath, errors="replace").read()
-                        except (OSError, UnicodeDecodeError):
-                            continue
+                    added = self.add(rel, text)
+                    print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
 
-                        added = self.add(rel, text, chunk_size)
-                        print(f"  rag: {rel} (+{added} chunks, {len(text)} chars)", file=sys.stderr, flush=True)
-
-    def add(self, path: str, text: str, chunk_size: int = 2000) -> int:
+    def add(self, path: str, text: str) -> int:
         added = 0
         dirty = False
 
-        for chunk in split_text(text, chunk_size):
+        for chunk in split_text(text, self.chunk_size):
             if not chunk.strip():
                 continue
 
