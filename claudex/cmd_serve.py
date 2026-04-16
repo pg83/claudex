@@ -1,22 +1,25 @@
 """serve subcommand: Starlette proxy server."""
 
-import argparse
-import json
 import os
 import sys
+import json
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional, Union
-
 import httpx
 import uvicorn
+import argparse
+
+from contextlib import asynccontextmanager
+
+from typing import AsyncIterator, Optional, Union
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 import claudex.common as cx
+import claudex.log as lg
 import claudex.rag as rag_mod
 
 
@@ -93,22 +96,8 @@ def sse_event(event_type: str, data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Logging
+# Message/content helpers
 # ---------------------------------------------------------------------------
-
-_REQ_COUNTER = 0
-
-
-def _next_req_id() -> str:
-    global _REQ_COUNTER
-    _REQ_COUNTER += 1
-    return f"#{_REQ_COUNTER:04d}"
-
-
-def log(msg: str, req_id: str = ""):
-    ts = time.strftime("%H:%M:%S")
-    prefix = f"{ts} {req_id} " if req_id else f"{ts} "
-    print(f"{prefix}{msg}", file=sys.stderr, flush=True)
 
 
 def _extract_text_content(content) -> str:
@@ -129,52 +118,6 @@ def _extract_last_user_text(messages: list) -> str:
         if msg.get("role") == "user":
             return _extract_text_content(msg.get("content", ""))
     return ""
-
-
-def _human_bytes(n: int) -> str:
-    if n < 1024:
-        return f"{n}B"
-    if n < 1024 * 1024:
-        return f"{n/1024:.1f}KB"
-    return f"{n/1024/1024:.1f}MB"
-
-
-def debug_log(config: dict, event: str, data=None, req_id: str = "", **extra):
-    if not config.get("debug"):
-        return
-    record = {"ts": time.strftime("%H:%M:%S"), "event": event}
-    if req_id:
-        record["req"] = req_id
-    record.update(extra)
-    if data is not None:
-        record["data"] = data
-    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
-
-
-def debug_sse(config: dict, direction: str, event_str: str, req_id: str = ""):
-    if not config.get("debug"):
-        return
-    lines = event_str.strip().split("\n")
-    etype = ""
-    edata = ""
-    for ln in lines:
-        if ln.startswith("event: "):
-            etype = ln[7:]
-        elif ln.startswith("data: "):
-            edata = ln[6:]
-    if len(edata) > 300:
-        edata = edata[:300] + "..."
-    record = {
-        "ts": time.strftime("%H:%M:%S"),
-        "event": "sse",
-        "req": req_id,
-        "dir": direction,
-    }
-    if etype:
-        record["sse_type"] = etype
-    if edata:
-        record["sse_data"] = edata
-    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -556,12 +499,12 @@ async def stream_translate(
     try:
         async for chunk in iter_openai_sse(openai_response):
             if chunk == "[DONE]":
-                debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
+                lg.debug_sse(config, "in", "event: done\ndata: [DONE]\n\n", req_id=req_id)
                 break
 
             _chunk_count += 1
             _raw_chunks.append(chunk)
-            debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
+            lg.debug_sse(config, "in", f"event: chunk\ndata: {json.dumps(chunk)}\n\n", req_id=req_id)
 
             choices = chunk.get("choices", [])
             if choices:
@@ -633,9 +576,9 @@ async def stream_translate(
 
     yield sse_event("message_stop", {})
 
-    log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
+    lg.log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
         req_id=req_id)
-    debug_log(config, "OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
+    lg.debug_log(config, "OPENAI RESPONSE (stream)", _raw_chunks, req_id=req_id,
               chunks=_chunk_count,
               stop=stop_reason,
               input_tokens=state.input_tokens,
@@ -730,13 +673,13 @@ async def fake_stream_from_response(anthropic_resp: dict, req_id: str = "") -> A
     yield sse_event("message_stop", {})
 
     usage = anthropic_resp.get("usage", {})
-    log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
+    lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
         req_id=req_id)
 
 
 async def _debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) -> AsyncIterator[str]:
     async for event_str in gen:
-        debug_sse(config, "out", event_str, req_id=req_id)
+        lg.debug_sse(config, "out", event_str, req_id=req_id)
         yield event_str
 
 
@@ -755,15 +698,15 @@ _FETCH_HEADERS = {
 async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: str = "") -> str:
     if name == "WebFetch":
         url = tool_input.get("url", "")
-        log(f"web_fetch {url}", req_id=req_id)
+        lg.log(f"web_fetch {url}", req_id=req_id)
         resp = await http_client.get(url, headers=_FETCH_HEADERS, timeout=15, follow_redirects=True)
         result = resp.text
-        debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
         return result
 
     if name in ("WebSearch", "web_search"):
         query = tool_input.get("query", "")
-        log(f"web_search {query}", req_id=req_id)
+        lg.log(f"web_search {query}", req_id=req_id)
         resp = await http_client.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
@@ -772,7 +715,7 @@ async def execute_proxy_tool(config: dict, name: str, tool_input: dict, req_id: 
             follow_redirects=True,
         )
         result = resp.text
-        debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+        lg.debug_log(config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
         return result
 
     return f"Unknown tool: {name}"
@@ -829,7 +772,7 @@ def _build_compress_body(messages: list, model: str) -> dict:
 async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> str:
     ep = cx.resolve_endpoint(config, "compress")
     compress_body = _build_compress_body(messages, ep["model"])
-    debug_log(config, "COMPRESS_REQ", compress_body, req_id=req_id)
+    lg.debug_log(config, "COMPRESS_REQ", compress_body, req_id=req_id)
 
     headers = {
         "Authorization": f"Bearer {ep['api_key']}",
@@ -843,7 +786,7 @@ async def call_compress_llm(config: dict, messages: list, req_id: str = "") -> s
     if "response" in data and "choices" not in data:
         data = data["response"]
 
-    debug_log(config, "COMPRESS_RESP", data, req_id=req_id)
+    lg.debug_log(config, "COMPRESS_RESP", data, req_id=req_id)
 
     return data["choices"][0]["message"]["content"] or ""
 
@@ -909,9 +852,9 @@ async def compress_context(config: dict, messages: list, req_id: str = "") -> li
     original_total = len(json.dumps(messages, ensure_ascii=False))
     compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
     ratio = original_total / compressed_bytes if compressed_bytes else 0
-    log(f"compress {len(messages)}→{len(compressed)} msgs, {_human_bytes(original_total)}→{_human_bytes(compressed_bytes)}, {ratio:.1f}x",
+    lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
         req_id=req_id)
-    debug_log(config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
+    lg.debug_log(config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
               original_msgs=len(messages),
               compressed_to=len(compressed),
               kept_verbatim=len(tail),
@@ -928,7 +871,7 @@ async def compress_context(config: dict, messages: list, req_id: str = "") -> li
 
 async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
     for _tool_iter in range(6):
-        debug_log(config, "OPENAI REQUEST", openai_body, req_id=req_id,
+        lg.debug_log(config, "OPENAI REQUEST", openai_body, req_id=req_id,
                   model=openai_body.get("model", ""),
                   base_url=ep["base_url"],
                   messages=len(openai_body.get("messages", [])))
@@ -936,7 +879,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: st
         openai_resp = await call_openai(openai_body, stream=False,
                                         base_url=ep["base_url"], api_key=ep["api_key"],
                                         client_headers=client_headers)
-        debug_log(config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
+        lg.debug_log(config, "OPENAI RESPONSE", openai_resp, req_id=req_id,
                   finish=openai_resp.get("choices", [{}])[0].get("finish_reason"))
 
         proxy_tools = _extract_proxy_tool_calls(openai_resp)
@@ -957,7 +900,7 @@ async def _proxy_tool_loop(openai_body: dict, ep: dict, config: dict, req_id: st
                 result = await execute_proxy_tool(config, tool_name, tool_input, req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
-                log(f"tool error {tool_name}: {e}", req_id=req_id)
+                lg.log(f"tool error {tool_name}: {e}", req_id=req_id)
             openai_body["messages"].append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -1011,13 +954,13 @@ def _extract_proxy_tool_uses(anthropic_resp: dict) -> list:
 async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id: str, client_headers=None) -> dict:
     resp: dict = {}
     for _ in range(6):
-        debug_log(config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
+        lg.debug_log(config, "ANTHROPIC UPSTREAM REQUEST", body, req_id=req_id,
                   model=body.get("model", ""),
                   base_url=ep["base_url"],
                   messages=len(body.get("messages", [])))
         resp = await call_anthropic(body, base_url=ep["base_url"], api_key=ep["api_key"],
                                     client_headers=client_headers)
-        debug_log(config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
+        lg.debug_log(config, "ANTHROPIC UPSTREAM RESPONSE", resp, req_id=req_id,
                   stop=resp.get("stop_reason"))
 
         proxy_uses = _extract_proxy_tool_uses(resp)
@@ -1032,7 +975,7 @@ async def _proxy_tool_loop_anthropic(body: dict, ep: dict, config: dict, req_id:
                 result = await execute_proxy_tool(config, tu["name"], tu.get("input", {}), req_id=req_id)
             except Exception as e:
                 result = f"Error: {e}"
-                log(f"tool error {tu['name']}: {e}", req_id=req_id)
+                lg.log(f"tool error {tu['name']}: {e}", req_id=req_id)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu["id"],
@@ -1075,8 +1018,8 @@ def _enrich_with_rag(body: dict, config: dict, req_id: str):
                 content.append({"type": "text", "text": suffix})
             break
     hits = " | ".join(f"{r['path']}:{r['idx']}({r['rank']:.1f})" for r in rag_results)
-    log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
-    debug_log(config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
+    lg.log(f"rag: {len(rag_results)} chunks — {hits}", req_id=req_id)
+    lg.debug_log(config, "RAG", {"query": last_text, "results": rag_results}, req_id=req_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1029,7 @@ def _enrich_with_rag(body: dict, config: dict, req_id: str):
 
 async def create_message(request: Request):
     config = request.app.state.config
-    req_id = _next_req_id()
+    req_id = lg.next_req_id()
 
     try:
         body = await request.json()
@@ -1101,10 +1044,10 @@ async def create_message(request: Request):
     body_bytes = len(json.dumps(body))
     stream_tag = "stream" if is_stream else "sync"
 
-    log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {_human_bytes(body_bytes)}, {stream_tag}",
+    lg.log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {lg.human_bytes(body_bytes)}, {stream_tag}",
         req_id=req_id)
 
-    debug_log(config, "ANTHROPIC REQUEST", body, req_id=req_id,
+    lg.debug_log(config, "ANTHROPIC REQUEST", body, req_id=req_id,
               model=anthropic_model, stream=is_stream,
               endpoint_model=ep["model"],
               messages=n_msgs, tools=n_tools)
@@ -1133,7 +1076,7 @@ async def create_message(request: Request):
             anthropic_resp = convert_response(openai_resp, anthropic_model)
 
         if is_stream:
-            debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+            lg.debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
                       stop=anthropic_resp.get("stop_reason"))
             return StreamingResponse(
                 _debug_stream_wrap(
@@ -1146,9 +1089,9 @@ async def create_message(request: Request):
             )
         else:
             usage = anthropic_resp.get("usage", {})
-            log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
+            lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {anthropic_resp.get('stop_reason','')}",
                 req_id=req_id)
-            debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
+            lg.debug_log(config, "ANTHROPIC RESPONSE", anthropic_resp, req_id=req_id,
                       stop=anthropic_resp.get("stop_reason"))
             return JSONResponse(content=anthropic_resp)
 
@@ -1157,12 +1100,12 @@ async def create_message(request: Request):
             error_body = e.response.json()
         except Exception:
             error_body = None
-        log(f"ERROR {e.response.status_code}", req_id=req_id)
-        debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
+        lg.log(f"ERROR {e.response.status_code}", req_id=req_id)
+        lg.debug_log(config, "OPENAI ERROR", error_body, req_id=req_id, status=e.response.status_code)
         return translate_openai_error(e.response.status_code, error_body)
     except Exception as e:
-        log(f"ERROR {e}", req_id=req_id)
-        debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
+        lg.log(f"ERROR {e}", req_id=req_id)
+        lg.debug_log(config, "PROXY ERROR", {"error": str(e)}, req_id=req_id)
         return error_response(500, "api_error", str(e))
 
 
