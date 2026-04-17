@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 
 FALLBACK_CHAIN = {
-    "compress": "haiku",
     "haiku": "sonnet",
     "sonnet": "opus",
 }
@@ -51,8 +50,6 @@ def load_config(path: str) -> dict:
 
     config: dict = {
         "debug": cfg.get("debug", False),
-        "compress_keep": cfg.get("compress_keep", 4),
-        "compress_min": cfg.get("compress_min", 8),
     }
 
     listen = cfg.get("listen", "127.0.0.1:8082")
@@ -88,7 +85,7 @@ def load_config(path: str) -> dict:
 def resolve_endpoint(config: dict, name: str) -> dict:
     """Resolve a role name or Anthropic model name to an endpoint dict.
 
-    Fallback chain (hardcoded): compress -> haiku -> sonnet -> opus.
+    Fallback chain (hardcoded): haiku -> sonnet -> opus.
     """
     endpoints = config.get("endpoints", {})
 

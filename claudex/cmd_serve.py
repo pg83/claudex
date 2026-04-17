@@ -20,27 +20,19 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex.log as lg
 import claudex.common as cx
-import claudex.search as search_mod
 import claudex.proto_common as pc
 import claudex.upper_openai as uo
 import claudex.upper_anthropic as ua
 
 
 # ---------------------------------------------------------------------------
-# ProxyServer: owns http clients, rag, compress, route handlers, lower session
+# ProxyServer: owns http clients, route handlers, lower session
 # ---------------------------------------------------------------------------
 
 
-SEARCH_SYSTEM_NOTE = (
-    "The next <cx:search>...</cx:search> block contains snippets from long-term "
-    "memory, maximally relevant to the current request."
-)
-
-
 class ProxyServer:
-    def __init__(self, config: dict, search: Optional["search_mod.Search"] = None):
+    def __init__(self, config: dict):
         self.config = config
-        self.search = search
         self.clients: dict[Optional[str], httpx.AsyncClient] = {}
         self.app = Starlette(
             lifespan=self.lifespan,
@@ -102,135 +94,6 @@ class ProxyServer:
 
         return f"Unknown tool: {name}"
 
-    # ----- compression -----
-
-    async def call_compress_llm(self, messages: list, req_id: str = "") -> str:
-        ep = cx.resolve_endpoint(self.config, "compress")
-        compress_body = pc.build_compress_body(messages, ep["model"])
-        lg.debug_log(self.config, "COMPRESS_REQ", compress_body, req_id=req_id)
-
-        headers = {
-            "Authorization": f"Bearer {ep['api_key']}",
-            "Content-Type": "application/json",
-        }
-        url = uo.chat_url(ep["base_url"])
-
-        resp = await self.client(ep.get("proxy")).post(url, json=compress_body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if "response" in data and "choices" not in data:
-            data = data["response"]
-
-        lg.debug_log(self.config, "COMPRESS_RESP", data, req_id=req_id)
-
-        return data["choices"][0]["message"]["content"] or ""
-
-    async def compress_context(self, messages: list, sid: str = "", req_id: str = "") -> list:
-        keep = self.config["compress_keep"]
-        min_msgs = self.config["compress_min"]
-
-        if len(messages) < min_msgs:
-            return messages
-
-        split = len(messages) - keep
-
-        if split < 2:
-            return messages
-
-        to_collapse = messages[:split]
-        tail = messages[split:]
-
-        collapsed = pc.collapse_messages(to_collapse)
-        compressed = [*collapsed, *tail]
-
-        original_total = len(json.dumps(messages, ensure_ascii=False))
-        compressed_bytes = len(json.dumps(compressed, ensure_ascii=False))
-        ratio = original_total / compressed_bytes if compressed_bytes else 0
-
-        lg.log(f"compress {len(messages)}→{len(compressed)} msgs, {lg.human_bytes(original_total)}→{lg.human_bytes(compressed_bytes)}, {ratio:.1f}x",
-            sid=sid)
-
-        lg.debug_log(self.config, "CONTEXT COMPRESSION", compressed, req_id=req_id,
-                  original_msgs=len(messages),
-                  compressed_to=len(compressed),
-                  kept_verbatim=len(tail),
-                  original_total=original_total,
-                  compressed_bytes=compressed_bytes)
-
-        return compressed
-
-    # ----- RAG enrichment -----
-
-    def enrich_with_search(self, body: dict, sid: str, req_id: str):
-        messages = body.get("messages", [])
-
-        for msg in messages:
-            if msg.get("role") != "user":
-                continue
-
-            text = pc.extract_msg_text(msg)
-
-            if text and "</" not in text:
-                self.search.add(f"conversation/{sid}", text)
-
-        last_idx = -1
-
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_idx = i
-                break
-
-        if last_idx < 0:
-            return
-
-        query = ""
-
-        for i in range(last_idx, -1, -1):
-            if messages[i].get("role") != "user":
-                continue
-
-            t = pc.extract_text_content(messages[i].get("content", ""))
-
-            if t:
-                query = t
-                break
-
-        if not query:
-            return
-
-        hits = self.search.search(query)
-
-        if not hits:
-            return
-
-        jsonl = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
-        wrapped = f"<cx:search>\n{jsonl}\n</cx:search>"
-
-        system = body.get("system")
-
-        if isinstance(system, str):
-            system = [{"type": "text", "text": system}] if system else []
-        elif not isinstance(system, list):
-            system = []
-
-        system.append({"type": "text", "text": SEARCH_SYSTEM_NOTE})
-        body["system"] = system
-
-        last_msg = messages[last_idx]
-        content = last_msg.get("content", "")
-
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}] if content else []
-        elif not isinstance(content, list):
-            content = []
-
-        content.append({"type": "text", "text": wrapped})
-        last_msg["content"] = content
-
-        lg.log(wrapped, sid=sid)
-        lg.debug_log(self.config, "SEARCH", {"query": query, "results": hits}, req_id=req_id)
-
     # ----- HTTP endpoints -----
 
     async def create_message(self, request: Request):
@@ -257,12 +120,6 @@ class ProxyServer:
                   sid=sid, model=anthropic_model, stream=is_stream,
                   endpoint_model=ep["model"],
                   messages=n_msgs, tools=n_tools)
-
-        if "compress" in self.config["endpoints"] and "messages" in body:
-            body["messages"] = await self.compress_context(body["messages"], sid=sid, req_id=req_id)
-
-        if self.search is not None:
-            self.enrich_with_search(body, sid, req_id)
 
         body["model"] = ep["model"]
 
@@ -294,7 +151,8 @@ class ProxyServer:
         proto = type(upper).__name__
 
         if is_stream:
-            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, stream=True, proto=proto)
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, stream=True, proto=proto,
+                      endpoint_model=body.get("model", ""), anthropic_model=anthropic_model)
             iterator = await upper.stream(body, client_headers, sid)
 
             return StreamingResponse(
@@ -307,6 +165,7 @@ class ProxyServer:
 
         for _ in range(6):
             lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, proto=proto,
+                      endpoint_model=body.get("model", ""), anthropic_model=anthropic_model,
                       messages=len(body.get("messages", [])))
             resp = await upper.call(body, client_headers, sid)
             lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, sid=sid, proto=proto,
@@ -364,7 +223,7 @@ class ProxyServer:
 
     async def list_models(self, request: Request):
         endpoints = self.config.get("endpoints", {})
-        models = [f"claude-{role}" for role in endpoints if role != "compress"] or [
+        models = [f"claude-{role}" for role in endpoints] or [
             "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
         ]
 
@@ -409,19 +268,6 @@ def cmd_serve(args: argparse.Namespace):
     for role, ep in endpoints.items():
         info(f"  {role} [{ep['protocol']}]: {ep['base_url']} -> {ep['model']}")
 
-    if "compress" in endpoints:
-        info(f"Compression: keep={config['compress_keep']}, min={config['compress_min']}")
-
-    search = None
-    search_cfg = config.get("search", {})
-
-    if search_cfg:
-        search = search_mod.Search(search_cfg)
-
-        for src, engines in search.engines_by_source.items():
-            engines_desc = ", ".join(f"{e.type_name}:{e.size}" for e in engines)
-            info(f"Search {src}: {engines_desc}")
-
     if config["debug"]:
         info("Debug: ENABLED (JSONL to stdout, redirect with > debug.jsonl)")
 
@@ -429,5 +275,5 @@ def cmd_serve(args: argparse.Namespace):
     info("Usage:")
     info(f"  ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_API_KEY=dummy claude")
 
-    server = ProxyServer(config, search)
+    server = ProxyServer(config)
     server.run()

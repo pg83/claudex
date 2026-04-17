@@ -6,6 +6,16 @@
       "base_url": "https://api.anthropic.com/v1",
       "model": "claude-opus-4-7",
       "proxy": "socks5://127.0.0.1:1083"
+    },
+    "sonnet": {
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-sonnet-4-6",
+      "proxy": "socks5://127.0.0.1:1083"
+    },
+    "haiku": {
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-haiku-4-5-20251001",
+      "proxy": "socks5://127.0.0.1:1083"
     }
   },
 
@@ -14,7 +24,8 @@
       {
         "type": "whoosh",
         "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-        "max_results": 3
+        "max_results": 10,
+        "snippet_chars": 100
       }
     ],
 

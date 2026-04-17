@@ -97,6 +97,26 @@ def debug_sse(config: dict, direction: str, event_str: str, req_id: str = "", si
         elif ln.startswith("data: "):
             edata = ln[6:]
 
+    stop_reason = ""
+    usage = None
+
+    if edata:
+        try:
+            parsed = json.loads(edata)
+        except ValueError:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            delta = parsed.get("delta")
+
+            if isinstance(delta, dict) and delta.get("stop_reason"):
+                stop_reason = delta["stop_reason"]
+
+            if isinstance(parsed.get("usage"), dict):
+                usage = parsed["usage"]
+            elif isinstance(parsed.get("message"), dict) and isinstance(parsed["message"].get("usage"), dict):
+                usage = parsed["message"]["usage"]
+
     if len(edata) > 300:
         edata = edata[:300] + "..."
 
@@ -114,6 +134,12 @@ def debug_sse(config: dict, direction: str, event_str: str, req_id: str = "", si
 
     if etype:
         record["sse_type"] = etype
+
+    if stop_reason:
+        record["stop_reason"] = stop_reason
+
+    if usage is not None:
+        record["usage"] = usage
 
     if edata:
         record["sse_data"] = edata

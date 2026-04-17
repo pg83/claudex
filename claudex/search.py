@@ -222,17 +222,13 @@ class WhooshEngine:
     def __init__(self, cfg: dict):
         from whoosh.fields import Schema, TEXT, ID
         from whoosh.filedb.filestore import RamStorage
-        from whoosh.analysis import NgramWordAnalyzer
 
         self.max_results = cfg.get("max_results", 5)
         self.snippet_chars = cfg.get("snippet_chars", 300)
 
-        ngram = cfg.get("ngram", 3)
-        analyzer = NgramWordAnalyzer(minsize=ngram, maxsize=ngram)
-
         self._schema = Schema(
             path=ID(stored=True, unique=True),
-            body=TEXT(stored=True, analyzer=analyzer),
+            body=TEXT(stored=True),
         )
         self._ix = RamStorage().create_index(self._schema)
 
@@ -319,13 +315,17 @@ class Search:
         for engine in self.engines_by_source.get(source, []):
             engine.add(path, text)
 
-    def search(self, query: str, limit: int = None) -> list[dict]:
+    def search(self, query: str, limit: int = None, exclude_paths: list[str] = None) -> list[dict]:
         k = 60
+        excluded = set(exclude_paths or [])
         hits = []
 
         for source, engines in self.engines_by_source.items():
             for engine in engines:
                 for pos, h in enumerate(engine.search(query)):
+                    if excluded and any(p in excluded for p in h["paths"]):
+                        continue
+
                     hits.append({
                         "paths": h["paths"],
                         "data": h["data"],
