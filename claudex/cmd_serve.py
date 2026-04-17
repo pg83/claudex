@@ -133,9 +133,18 @@ class ProxyServer:
         if name == "WebFetch":
             url = tool_input.get("url", "")
             lg.log(f"web_fetch {url}", sid=sid)
-            resp = await self.client().get(url, headers=FETCH_HEADERS, timeout=15, follow_redirects=True)
+            resp = await self.client().get(
+                url,
+                headers=FETCH_HEADERS,
+                timeout=15,
+                follow_redirects=True,
+            )
             result = resp.text
-            lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+            lg.debug_log(self.config, "TOOL EXECUTE", {
+                "name": name,
+                "input": tool_input,
+                "output": result,
+            }, req_id=req_id)
 
             return result
 
@@ -152,7 +161,11 @@ class ProxyServer:
             )
 
             result = resp.text
-            lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
+            lg.debug_log(self.config, "TOOL EXECUTE", {
+                "name": name,
+                "input": tool_input,
+                "output": result,
+            }, req_id=req_id)
 
             return result
 
@@ -180,10 +193,15 @@ class ProxyServer:
         lg.log(f"{anthropic_model} -> {ep['model']} | {n_msgs} msgs, {n_tools} tools, ~{body_bytes//4}tok, {lg.human_bytes(body_bytes)}, {stream_tag}",
             sid=sid)
 
-        lg.debug_log(self.config, "ANTHROPIC REQUEST", body, req_id=req_id,
-                  sid=sid, model=anthropic_model, stream=is_stream,
-                  endpoint_model=ep["model"],
-                  messages=n_msgs, tools=n_tools)
+        lg.debug_log(self.config, "ANTHROPIC REQUEST", body,
+            req_id=req_id,
+            sid=sid,
+            model=anthropic_model,
+            stream=is_stream,
+            endpoint_model=ep["model"],
+            messages=n_msgs,
+            tools=n_tools,
+        )
 
         body["model"] = ep["model"]
 
@@ -201,13 +219,20 @@ class ProxyServer:
                 error_body = None
 
             lg.log(f"ERROR {e.response.status_code}", sid=sid)
-            lg.debug_log(self.config, "UPSTREAM ERROR", error_body, req_id=req_id, sid=sid, status=e.response.status_code)
+            lg.debug_log(self.config, "UPSTREAM ERROR", error_body,
+                req_id=req_id,
+                sid=sid,
+                status=e.response.status_code,
+            )
 
             return upper.translate_error(e.response.status_code, error_body)
 
         except Exception as e:
             lg.log(f"ERROR {e}", sid=sid)
-            lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id, sid=sid)
+            lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)},
+                req_id=req_id,
+                sid=sid,
+            )
 
             return cx.error_response(500, "api_error", str(e))
 
@@ -215,8 +240,14 @@ class ProxyServer:
         proto = type(upper).__name__
 
         if is_stream:
-            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, stream=True, proto=proto,
-                      endpoint_model=body.get("model", ""), anthropic_model=anthropic_model)
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body,
+                req_id=req_id,
+                sid=sid,
+                stream=True,
+                proto=proto,
+                endpoint_model=body.get("model", ""),
+                anthropic_model=anthropic_model,
+            )
             iterator = await upper.stream(body, client_headers, sid)
 
             return StreamingResponse(
@@ -228,19 +259,31 @@ class ProxyServer:
         resp: dict = {}
 
         for _ in range(6):
-            lg.debug_log(self.config, "UPSTREAM REQUEST", body, req_id=req_id, sid=sid, proto=proto,
-                      endpoint_model=body.get("model", ""), anthropic_model=anthropic_model,
-                      messages=len(body.get("messages", [])))
+            lg.debug_log(self.config, "UPSTREAM REQUEST", body,
+                req_id=req_id,
+                sid=sid,
+                proto=proto,
+                endpoint_model=body.get("model", ""),
+                anthropic_model=anthropic_model,
+                messages=len(body.get("messages", [])),
+            )
             resp = await upper.call(body, client_headers, sid)
-            lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, sid=sid, proto=proto,
-                      stop=resp.get("stop_reason"))
+            lg.debug_log(self.config, "UPSTREAM RESPONSE", resp,
+                req_id=req_id,
+                sid=sid,
+                proto=proto,
+                stop=resp.get("stop_reason"),
+            )
 
             proxy_uses = extract_proxy_tool_uses(resp)
 
             if not proxy_uses:
                 break
 
-            body["messages"].append({"role": "assistant", "content": resp.get("content", [])})
+            body["messages"].append({
+                "role": "assistant",
+                "content": resp.get("content", []),
+            })
 
             tool_results = []
 
@@ -257,15 +300,21 @@ class ProxyServer:
                     "content": result,
                 })
 
-            body["messages"].append({"role": "user", "content": tool_results})
+            body["messages"].append({
+                "role": "user",
+                "content": tool_results,
+            })
 
         resp["model"] = anthropic_model
 
         usage = resp.get("usage", {})
         lg.log(f"done | {usage.get('input_tokens',0)}in/{usage.get('output_tokens',0)}out | {resp.get('stop_reason','')}",
             sid=sid)
-        lg.debug_log(self.config, "ANTHROPIC RESPONSE", resp, req_id=req_id, sid=sid,
-                  stop=resp.get("stop_reason"))
+        lg.debug_log(self.config, "ANTHROPIC RESPONSE", resp,
+            req_id=req_id,
+            sid=sid,
+            stop=resp.get("stop_reason"),
+        )
 
         return JSONResponse(content=resp)
 
@@ -293,7 +342,12 @@ class ProxyServer:
 
         return JSONResponse(content={
             "data": [
-                {"id": m, "type": "model", "display_name": m, "created_at": "2025-01-01T00:00:00Z"}
+                {
+                    "id": m,
+                    "type": "model",
+                    "display_name": m,
+                    "created_at": "2025-01-01T00:00:00Z",
+                }
                 for m in models
             ],
             "has_more": False,
@@ -302,7 +356,13 @@ class ProxyServer:
     def run(self):
         host = self.config.get("host", "127.0.0.1")
         port = self.config.get("port", 8082)
-        uvicorn.run(self.app, host=host, port=port, log_level="info", access_log=False)
+        uvicorn.run(
+            self.app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=False,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -67,7 +67,10 @@ def debug_log(config: dict, event: str, data=None, req_id: str = "", sid: str = 
     if not config.get("debug"):
         return
 
-    record = {"ts": time.strftime("%H:%M:%S"), "event": event}
+    record = {
+        "ts": time.strftime("%H:%M:%S"),
+        "event": event,
+    }
 
     if req_id:
         record["req"] = req_id

@@ -53,15 +53,24 @@ def convert_content_to_openai(content):
         btype = block.get("type")
 
         if btype == "text":
-            parts.append({"type": "text", "text": block["text"]})
+            parts.append({
+                "type": "text",
+                "text": block["text"],
+            })
         elif btype == "image":
             source = block["source"]
 
             if source.get("type") == "base64":
                 url = f"data:{source['media_type']};base64,{source['data']}"
-                parts.append({"type": "image_url", "image_url": {"url": url}})
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                })
             elif source.get("type") == "url":
-                parts.append({"type": "image_url", "image_url": {"url": source["url"]}})
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": source["url"]},
+                })
 
     if not parts:
         return ""
@@ -96,14 +105,21 @@ def convert_tools(anthropic_tools: list) -> list:
             "function": {
                 "name": tool["name"],
                 "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                "parameters": tool.get("input_schema", {
+                    "type": "object",
+                    "properties": {},
+                }),
             },
         }
         for tool in anthropic_tools
     ]
 
 
-TOOL_CHOICE_MAP = {"auto": "auto", "any": "required", "none": "none"}
+TOOL_CHOICE_MAP = {
+    "auto": "auto",
+    "any": "required",
+    "none": "none",
+}
 
 
 def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
@@ -113,7 +129,10 @@ def convert_tool_choice(anthropic_tc) -> Union[str, dict]:
     tc_type = anthropic_tc.get("type", "auto")
 
     if tc_type == "tool":
-        return {"type": "function", "function": {"name": anthropic_tc["name"]}}
+        return {
+            "type": "function",
+            "function": {"name": anthropic_tc["name"]},
+        }
 
     return TOOL_CHOICE_MAP.get(tc_type, "auto")
 
@@ -139,14 +158,20 @@ def convert_user_msg(content) -> list[dict]:
         converted = convert_content_to_openai(other_blocks)
 
         if converted:
-            result.append({"role": "user", "content": converted})
+            result.append({
+                "role": "user",
+                "content": converted,
+            })
 
     return result
 
 
 def convert_assistant_msg(content) -> dict:
     if isinstance(content, str):
-        return {"role": "assistant", "content": content}
+        return {
+            "role": "assistant",
+            "content": content,
+        }
 
     if isinstance(content, list):
         text_parts = []
@@ -176,7 +201,10 @@ def convert_assistant_msg(content) -> dict:
 
         return assistant_msg
 
-    return {"role": "assistant", "content": str(content)}
+    return {
+        "role": "assistant",
+        "content": str(content),
+    }
 
 
 def convert_request(body: dict, openai_model: str) -> dict:
@@ -188,7 +216,10 @@ def convert_request(body: dict, openai_model: str) -> dict:
     system_text = cx.extract_system_text(body.get("system"))
 
     if system_text:
-        openai_messages.append({"role": "developer", "content": system_text})
+        openai_messages.append({
+            "role": "developer",
+            "content": system_text,
+        })
 
     for msg in body.get("messages", []):
         role = msg["role"]
@@ -269,7 +300,10 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
         })
 
     if msg.get("content"):
-        content_blocks.append({"type": "text", "text": msg["content"]})
+        content_blocks.append({
+            "type": "text",
+            "text": msg["content"],
+        })
 
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
@@ -286,7 +320,10 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
             })
 
     if not content_blocks:
-        content_blocks.append({"type": "text", "text": ""})
+        content_blocks.append({
+            "type": "text",
+            "text": "",
+        })
 
     stop_reason = FINISH_REASON_MAP.get(choice.get("finish_reason"), "end_turn")
     usage = openai_resp.get("usage", {})
@@ -356,7 +393,10 @@ def close_block_events(state: StreamState) -> list[str]:
     if state.current_block_type == "thinking":
         events.append(sse_event("content_block_delta", {
             "index": state.block_index,
-            "delta": {"type": "signature_delta", "signature": ""},
+            "delta": {
+                "type": "signature_delta",
+                "signature": "",
+            },
         }))
 
     events.append(sse_event("content_block_stop", {
@@ -402,7 +442,10 @@ async def stream_translate(
             "model": anthropic_model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
         },
     })
 
@@ -435,23 +478,35 @@ async def stream_translate(
                 reasoning = delta.get("reasoning_content")
 
                 if reasoning:
-                    for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
+                    for ev in open_block_events(state, "thinking", {
+                        "type": "thinking",
+                        "thinking": "",
+                    }):
                         yield ev
 
                     yield sse_event("content_block_delta", {
                         "index": state.block_index,
-                        "delta": {"type": "thinking_delta", "thinking": reasoning},
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": reasoning,
+                        },
                     })
 
                 text = delta.get("content")
 
                 if text:
-                    for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
+                    for ev in open_block_events(state, "text", {
+                        "type": "text",
+                        "text": "",
+                    }):
                         yield ev
 
                     yield sse_event("content_block_delta", {
                         "index": state.block_index,
-                        "delta": {"type": "text_delta", "text": text},
+                        "delta": {
+                            "type": "text_delta",
+                            "text": text,
+                        },
                     })
 
                 tc_deltas = delta.get("tool_calls")
@@ -472,7 +527,10 @@ async def stream_translate(
                             yield sse_event("content_block_start", {
                                 "index": state.block_index,
                                 "content_block": {
-                                    "type": "tool_use", "id": tool_id, "name": tool_name, "input": {},
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": tool_name,
+                                    "input": {},
                                 },
                             })
 
@@ -481,7 +539,10 @@ async def stream_translate(
                         if args_chunk:
                             yield sse_event("content_block_delta", {
                                 "index": state.block_index,
-                                "delta": {"type": "input_json_delta", "partial_json": args_chunk},
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": args_chunk,
+                                },
                             })
 
             usage = chunk.get("usage")
@@ -498,7 +559,10 @@ async def stream_translate(
     stop_reason = FINISH_REASON_MAP.get(finish_reason, "end_turn")
 
     yield sse_event("message_delta", {
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+        },
         "usage": {"output_tokens": state.output_tokens},
     })
 
@@ -506,11 +570,13 @@ async def stream_translate(
 
     lg.log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
         sid=sid)
-    lg.debug_log(config, "OPENAI RESPONSE (stream)", raw_chunks, sid=sid,
-              chunks=chunk_count,
-              stop=stop_reason,
-              input_tokens=state.input_tokens,
-              output_tokens=state.output_tokens)
+    lg.debug_log(config, "OPENAI RESPONSE (stream)", raw_chunks,
+        sid=sid,
+        chunks=chunk_count,
+        stop=stop_reason,
+        input_tokens=state.input_tokens,
+        output_tokens=state.output_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +609,12 @@ class OpenAIUpper:
         http = self.server.client(self.ep.get("proxy"))
 
         if stream:
-            req = http.build_request("POST", url, json=openai_body, headers=headers)
+            req = http.build_request(
+                "POST",
+                url,
+                json=openai_body,
+                headers=headers,
+            )
             resp = await http.send(req, stream=True)
 
             if resp.status_code != 200:
@@ -559,7 +630,11 @@ class OpenAIUpper:
 
             return resp
 
-        resp = await http.post(url, json=openai_body, headers=headers)
+        resp = await http.post(
+            url,
+            json=openai_body,
+            headers=headers,
+        )
         resp.raise_for_status()
         data = resp.json()
 

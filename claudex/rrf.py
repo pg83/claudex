@@ -33,8 +33,12 @@ def test():
 
     # single hit: one group, one member, rank = 1/(k+1)
     out = fuse([{
-        "paths": frozenset(["a"]), "data": "x", "source": "fs",
-        "engine": "whoosh", "raw_score": 1.0, "pos": 0,
+        "paths": frozenset(["a"]),
+        "data": "x",
+        "source": "fs",
+        "engine": "whoosh",
+        "raw_score": 1.0,
+        "pos": 0,
     }])
     assert len(out) == 1
     assert out[0]["paths"] == ["a"]
@@ -45,15 +49,27 @@ def test():
 
     # two non-overlapping hits -> two groups, sorted by rank desc
     out = fuse([
-        {"paths": frozenset(["a"]), "data": "d1", "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 1},
-        {"paths": frozenset(["b"]), "data": "d2", "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0},
+        {
+            "paths": frozenset(["a"]), "data": "d1",
+            "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 1,
+        },
+        {
+            "paths": frozenset(["b"]), "data": "d2",
+            "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0,
+        },
     ])
     assert [h["paths"] for h in out] == [["b"], ["a"]]
 
     # same path, two engines -> one group with summed rank; members ordered by raw_score desc
     out = fuse([
-        {"paths": frozenset(["a"]), "data": "long data", "source": "fs", "engine": "whoosh", "raw_score": 2.0, "pos": 0},
-        {"paths": frozenset(["a"]), "data": "x",        "source": "fs", "engine": "rag",    "raw_score": 0.5, "pos": 0},
+        {
+            "paths": frozenset(["a"]), "data": "long data",
+            "source": "fs", "engine": "whoosh", "raw_score": 2.0, "pos": 0,
+        },
+        {
+            "paths": frozenset(["a"]), "data": "x",
+            "source": "fs", "engine": "rag", "raw_score": 0.5, "pos": 0,
+        },
     ])
     assert len(out) == 1
     assert out[0]["paths"] == ["a"]
@@ -63,10 +79,22 @@ def test():
 
     # transitive overlap across three hits via shared paths; all three kept as members
     out = fuse([
-        {"paths": frozenset(["a", "b"]), "data": "AAAA", "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0},
-        {"paths": frozenset(["b", "c"]), "data": "B",    "source": "fs", "engine": "e", "raw_score": 3.0, "pos": 1},
-        {"paths": frozenset(["c", "d"]), "data": "CCCC", "source": "fs", "engine": "e", "raw_score": 2.0, "pos": 2},
-        {"paths": frozenset(["z"]),      "data": "Z",    "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0},
+        {
+            "paths": frozenset(["a", "b"]), "data": "AAAA",
+            "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0,
+        },
+        {
+            "paths": frozenset(["b", "c"]), "data": "B",
+            "source": "fs", "engine": "e", "raw_score": 3.0, "pos": 1,
+        },
+        {
+            "paths": frozenset(["c", "d"]), "data": "CCCC",
+            "source": "fs", "engine": "e", "raw_score": 2.0, "pos": 2,
+        },
+        {
+            "paths": frozenset(["z"]), "data": "Z",
+            "source": "fs", "engine": "e", "raw_score": 1.0, "pos": 0,
+        },
     ])
     assert len(out) == 2
     merged = next(h for h in out if "a" in h["paths"])
@@ -80,8 +108,14 @@ def test():
 
     # k parameter affects magnitude but not relative order
     big_k = fuse([
-        {"paths": frozenset(["a"]), "data": "x", "source": "fs", "engine": "e", "raw_score": 0, "pos": 0},
-        {"paths": frozenset(["b"]), "data": "x", "source": "fs", "engine": "e", "raw_score": 0, "pos": 1},
+        {
+            "paths": frozenset(["a"]), "data": "x",
+            "source": "fs", "engine": "e", "raw_score": 0, "pos": 0,
+        },
+        {
+            "paths": frozenset(["b"]), "data": "x",
+            "source": "fs", "engine": "e", "raw_score": 0, "pos": 1,
+        },
     ], k=1000)
     assert big_k[0]["rank"] == 1.0 / 1001
     assert big_k[1]["rank"] == 1.0 / 1002

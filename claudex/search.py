@@ -27,7 +27,10 @@ def make_ollama_embedder(url: str = OLLAMA_URL, model: str = OLLAMA_MODEL) -> Ca
     client = httpx.Client(timeout=60.0)
 
     def embed(text: str) -> list[float]:
-        resp = client.post(url, json={"model": model, "input": text})
+        resp = client.post(url, json={
+            "model": model,
+            "input": text,
+        })
         resp.raise_for_status()
 
         return resp.json()["embeddings"][0]
@@ -339,7 +342,12 @@ def test():
         with open(beta, "w") as f:
             f.write("another fox appears at dawn beneath silver moons")
 
-        cfg = {"dirs": [d], "max_results": 5, "snippet_chars": 100, "extensions": [".txt"]}
+        cfg = {
+            "dirs": [d],
+            "max_results": 5,
+            "snippet_chars": 100,
+            "extensions": [".txt"],
+        }
 
         with contextlib.redirect_stderr(io.StringIO()):
             engine = WhooshEngine(cfg)

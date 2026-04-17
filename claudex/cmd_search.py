@@ -14,8 +14,14 @@ MAGENTA = "\033[35m"
 GREEN = "\033[32m"
 
 
-SOURCE_COLORS = {"fs": CYAN, "conversation": YELLOW}
-ENGINE_COLORS = {"rag": GREEN, "whoosh": MAGENTA}
+SOURCE_COLORS = {
+    "fs": CYAN,
+    "conversation": YELLOW,
+}
+ENGINE_COLORS = {
+    "rag": GREEN,
+    "whoosh": MAGENTA,
+}
 
 
 def cmd_search(args: argparse.Namespace):

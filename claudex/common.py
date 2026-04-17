@@ -90,10 +90,16 @@ def load_config(path: str) -> dict:
 
 
 def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={
-        "type": "error",
-        "error": {"type": etype, "message": message},
-    })
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {
+                "type": etype,
+                "message": message,
+            },
+        },
+    )
 
 
 def extract_text_content(content) -> str:
@@ -156,4 +162,10 @@ def resolve_endpoint(config: dict, name: str) -> dict:
     if endpoints:
         return next(iter(endpoints.values()))
 
-    return {"base_url": "", "model": name, "api_key": "", "ssl_verify": False, "protocol": "openai"}
+    return {
+        "base_url": "",
+        "model": name,
+        "api_key": "",
+        "ssl_verify": False,
+        "protocol": "openai",
+    }

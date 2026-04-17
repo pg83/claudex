@@ -29,7 +29,12 @@ class AnthropicUpper:
     async def _send(self, body: dict, client_headers, stream: bool) -> httpx.Response:
         url = self.ep["base_url"].rstrip("/") + "/messages"
         http = self.server.client(self.ep.get("proxy"))
-        req = http.build_request("POST", url, json={**body, "stream": stream}, headers=upstream_headers(client_headers, self.ep))
+        req = http.build_request(
+            "POST",
+            url,
+            json={**body, "stream": stream},
+            headers=upstream_headers(client_headers, self.ep),
+        )
         resp = await http.send(req, stream=stream)
 
         if resp.status_code != 200:
@@ -37,7 +42,11 @@ class AnthropicUpper:
 
             await resp.aclose()
 
-            raise httpx.HTTPStatusError(f"Anthropic {resp.status_code}", request=req, response=resp)
+            raise httpx.HTTPStatusError(
+                f"Anthropic {resp.status_code}",
+                request=req,
+                response=resp,
+            )
 
         return resp
 
@@ -53,7 +62,10 @@ class AnthropicUpper:
 
     def translate_error(self, status_code: int, error_body: Optional[dict]) -> JSONResponse:
         if isinstance(error_body, dict) and error_body.get("type") == "error":
-            return JSONResponse(status_code=status_code, content=error_body)
+            return JSONResponse(
+                status_code=status_code,
+                content=error_body,
+            )
 
         return cx.error_response(status_code, "api_error", f"Upstream {status_code}")
 
