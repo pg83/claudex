@@ -141,7 +141,7 @@ class RAG:
         dirty = False
 
         for chunk in split_text(text, self.chunk_size):
-            if not chunk.strip():
+            if len(chunk.strip()) < 50:
                 continue
 
             sha = hashlib.sha256(chunk.encode()).hexdigest()

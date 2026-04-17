@@ -12,18 +12,9 @@
   "search": {
     "fs": [
       {
-        "type": "rag",
-        "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-        "chunk_size": 2000,
-        "max_results": 3,
-        "db": "~/.cache/claudex/rag_files.db",
-        "embed_url": "http://10.0.0.227:11434/api/embed",
-        "embed_model": "nomic-embed-text"
-      },
-      {
         "type": "whoosh",
         "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-        "max_results": 5
+        "max_results": 3
       }
     ],
 
@@ -32,7 +23,7 @@
         "type": "rag",
         "chunk_size": 500,
         "max_results": 2,
-        "db": "~/.cache/claudex/rag_conv.db",
+        "db": "~/.cache/claudex/$RANDOM.db",
         "embed_url": "http://10.0.0.227:11434/api/embed",
         "embed_model": "nomic-embed-text"
       },

@@ -31,6 +31,12 @@ import claudex.upper_anthropic as ua
 # ---------------------------------------------------------------------------
 
 
+SEARCH_SYSTEM_NOTE = (
+    "The next <cx:search>...</cx:search> block contains snippets from long-term "
+    "memory, maximally relevant to the current request."
+)
+
+
 class ProxyServer:
     def __init__(self, config: dict, search: Optional["search_mod.Search"] = None):
         self.config = config
@@ -157,29 +163,73 @@ class ProxyServer:
     # ----- RAG enrichment -----
 
     def enrich_with_search(self, body: dict, sid: str, req_id: str):
-        for msg in body.get("messages", []):
+        messages = body.get("messages", [])
+
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+
             text = pc.extract_msg_text(msg)
 
-            if text:
-                self.search.add(f"conversation/{sid}/{msg['role']}", text)
+            if text and "</" not in text:
+                self.search.add(f"conversation/{sid}", text)
 
-        last_text = pc.extract_last_user_text(body.get("messages", []))
+        last_idx = -1
 
-        if not last_text:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_idx = i
+                break
+
+        if last_idx < 0:
             return
 
-        hits = self.search.search(last_text)
+        query = ""
+
+        for i in range(last_idx, -1, -1):
+            if messages[i].get("role") != "user":
+                continue
+
+            t = pc.extract_text_content(messages[i].get("content", ""))
+
+            if t:
+                query = t
+                break
+
+        if not query:
+            return
+
+        hits = self.search.search(query)
 
         if not hits:
             return
 
-        block = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
-        wrapped = f"<cx:search>\n{block}\n</cx:search>"
+        jsonl = "\n".join(json.dumps(h, ensure_ascii=False) for h in hits)
+        wrapped = f"<cx:search>\n{jsonl}\n</cx:search>"
 
-        body.setdefault("messages", []).append({"role": "user", "content": wrapped})
+        system = body.get("system")
+
+        if isinstance(system, str):
+            system = [{"type": "text", "text": system}] if system else []
+        elif not isinstance(system, list):
+            system = []
+
+        system.append({"type": "text", "text": SEARCH_SYSTEM_NOTE})
+        body["system"] = system
+
+        last_msg = messages[last_idx]
+        content = last_msg.get("content", "")
+
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+        elif not isinstance(content, list):
+            content = []
+
+        content.append({"type": "text", "text": wrapped})
+        last_msg["content"] = content
 
         lg.log(wrapped, sid=sid)
-        lg.debug_log(self.config, "SEARCH", {"query": last_text, "results": hits}, req_id=req_id)
+        lg.debug_log(self.config, "SEARCH", {"query": query, "results": hits}, req_id=req_id)
 
     # ----- HTTP endpoints -----
 

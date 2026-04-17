@@ -3,6 +3,7 @@
 import os
 import re
 import json
+import random
 
 from urllib.parse import urlparse
 
@@ -41,7 +42,10 @@ def _strip_chat_suffix(url: str) -> str:
 def load_config(path: str) -> dict:
     """Load JSON config file and return a config dict with nested endpoints."""
     with open(path) as f:
-        cfg = json.load(f)
+        raw = f.read()
+
+    raw = re.sub(r'\$RANDOM', lambda _: str(random.randint(0, 32767)), raw)
+    cfg = json.loads(raw)
 
     shared_api_key = _expand_env(cfg.get("api_key", ""))
 
