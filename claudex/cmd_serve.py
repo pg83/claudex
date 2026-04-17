@@ -89,34 +89,6 @@ async def debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) 
         yield event_str
 
 
-def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={
-        "type": "error",
-        "error": {"type": etype, "message": message},
-    })
-
-
-def translate_openai_error(status_code: int, openai_error: Optional[dict] = None) -> JSONResponse:
-    error_msg = "Unknown error"
-
-    if openai_error and "error" in openai_error:
-        err = openai_error["error"]
-        error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-
-    if status_code == 429:
-        etype = "rate_limit_error"
-    elif status_code == 401:
-        etype = "authentication_error"
-    elif status_code >= 500:
-        status_code = 529
-        etype = "overloaded_error"
-    else:
-        status_code = 400
-        etype = "invalid_request_error"
-
-    return error_response(status_code, etype, error_msg)
-
-
 # ---------------------------------------------------------------------------
 # ProxyServer: owns http clients, route handlers, lower session
 # ---------------------------------------------------------------------------
@@ -194,7 +166,7 @@ class ProxyServer:
         try:
             body = await request.json()
         except Exception:
-            return error_response(400, "invalid_request_error", "Invalid JSON body")
+            return cx.error_response(400, "invalid_request_error", "Invalid JSON body")
 
         sid = session_id(body.get("messages", []))
         anthropic_model = body.get("model", "")
@@ -231,13 +203,13 @@ class ProxyServer:
             lg.log(f"ERROR {e.response.status_code}", sid=sid)
             lg.debug_log(self.config, "UPSTREAM ERROR", error_body, req_id=req_id, sid=sid, status=e.response.status_code)
 
-            return translate_openai_error(e.response.status_code, error_body)
+            return upper.translate_error(e.response.status_code, error_body)
 
         except Exception as e:
             lg.log(f"ERROR {e}", sid=sid)
             lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id, sid=sid)
 
-            return error_response(500, "api_error", str(e))
+            return cx.error_response(500, "api_error", str(e))
 
     async def _lower_handle(self, upper, body: dict, anthropic_model: str, sid: str, req_id: str, client_headers, is_stream: bool):
         proto = type(upper).__name__

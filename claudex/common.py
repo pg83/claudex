@@ -7,6 +7,8 @@ import random
 
 from urllib.parse import urlparse
 
+from starlette.responses import JSONResponse
+
 
 FALLBACK_CHAIN = {
     "haiku": "sonnet",
@@ -80,6 +82,13 @@ def load_config(path: str) -> dict:
     config["endpoints"] = endpoints
 
     return config
+
+
+def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={
+        "type": "error",
+        "error": {"type": etype, "message": message},
+    })
 
 
 def extract_text_content(content) -> str:

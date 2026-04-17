@@ -4,6 +4,8 @@ import httpx
 
 from typing import AsyncIterator, Optional, Union
 
+from starlette.responses import JSONResponse
+
 import claudex.log as lg
 import claudex.common as cx
 
@@ -583,3 +585,23 @@ class OpenAIUpper:
         resp = await self._post(openai_body, client_headers, stream=True)
 
         return stream_translate(resp, body["model"], self.server.config, sid=sid)
+
+    def translate_error(self, status_code: int, error_body: Optional[dict]) -> JSONResponse:
+        error_msg = "Unknown error"
+
+        if error_body and "error" in error_body:
+            err = error_body["error"]
+            error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+
+        if status_code == 429:
+            etype = "rate_limit_error"
+        elif status_code == 401:
+            etype = "authentication_error"
+        elif status_code >= 500:
+            status_code = 529
+            etype = "overloaded_error"
+        else:
+            status_code = 400
+            etype = "invalid_request_error"
+
+        return cx.error_response(status_code, etype, error_msg)

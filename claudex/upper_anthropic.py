@@ -1,6 +1,10 @@
 import httpx
 
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
+
+from starlette.responses import JSONResponse
+
+import claudex.common as cx
 
 
 HOP_BY_HOP = frozenset({"host", "content-length", "connection", "transfer-encoding", "accept-encoding"})
@@ -46,6 +50,12 @@ class AnthropicUpper:
         resp = await self._send(body, client_headers, stream=True)
 
         return _iter_chunks(resp)
+
+    def translate_error(self, status_code: int, error_body: Optional[dict]) -> JSONResponse:
+        if isinstance(error_body, dict) and error_body.get("type") == "error":
+            return JSONResponse(status_code=status_code, content=error_body)
+
+        return cx.error_response(status_code, "api_error", f"Upstream {status_code}")
 
 
 async def _iter_chunks(resp: httpx.Response) -> AsyncIterator[str]:
