@@ -84,6 +84,9 @@ def walk_files(cfg: dict):
                 if os.path.splitext(fname)[1] not in extensions:
                     continue
 
+                if fname.endswith("_ut.cpp"):
+                    continue
+
                 fpath = os.path.join(root, fname)
                 rel = os.path.abspath(fpath)
 
