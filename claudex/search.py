@@ -116,7 +116,9 @@ class RAG:
             embedder = make_ollama_embedder(url, model)
 
         self.embedder = embedder
-        self.cache: dict[str, list[float]] = {}
+        self.emb_by_sha: dict[str, list[float]] = {}
+        self.chunk_by_sha: dict[str, str] = {}
+        self.paths_by_sha: dict[str, list[str]] = {}
 
         db_path = os.path.expanduser(cfg.get("db", "~/.cache/claudex/rag.db"))
         parent = os.path.dirname(db_path)
@@ -124,18 +126,13 @@ class RAG:
         if parent:
             os.makedirs(parent, exist_ok=True)
 
-        self.db_path = db_path
         self.db = sqlite3.connect(db_path)
-
         self.db.execute(
-            "CREATE TABLE IF NOT EXISTS chunks (sha TEXT PRIMARY KEY, data TEXT, embedding BLOB)"
-        )
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS paths (sha TEXT, path TEXT, PRIMARY KEY (sha, path))"
+            "CREATE TABLE IF NOT EXISTS embeddings (sha TEXT PRIMARY KEY, embedding BLOB)"
         )
 
-        for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM chunks"):
-            self.cache[sha] = pickle.loads(emb_blob)
+        for sha, emb_blob in self.db.execute("SELECT sha, embedding FROM embeddings"):
+            self.emb_by_sha[sha] = pickle.loads(emb_blob)
 
         for path, text in walk_files(cfg):
             added = self.add(path, text)
@@ -151,23 +148,21 @@ class RAG:
 
             sha = hashlib.sha256(chunk.encode()).hexdigest()
 
-            if sha not in self.cache:
+            if sha not in self.emb_by_sha:
                 vec = self.embedder(chunk)
                 self.db.execute(
-                    "INSERT INTO chunks (sha, data, embedding) VALUES (?, ?, ?)",
-                    (sha, chunk, pickle.dumps(vec)),
+                    "INSERT INTO embeddings (sha, embedding) VALUES (?, ?)",
+                    (sha, pickle.dumps(vec)),
                 )
-                self.cache[sha] = vec
+                self.emb_by_sha[sha] = vec
                 added += 1
                 dirty = True
 
-            cur = self.db.execute(
-                "INSERT OR IGNORE INTO paths (sha, path) VALUES (?, ?)",
-                (sha, path),
-            )
+            self.chunk_by_sha[sha] = chunk
+            paths = self.paths_by_sha.setdefault(sha, [])
 
-            if cur.rowcount > 0:
-                dirty = True
+            if path not in paths:
+                paths.append(path)
 
         if dirty:
             self.db.commit()
@@ -175,45 +170,27 @@ class RAG:
         return added
 
     def search(self, query: str) -> list[dict]:
-        if not self.cache:
+        if not self.chunk_by_sha:
             return []
 
         qvec = self.embedder(query)
-        scored = [(cosine(qvec, vec), sha) for sha, vec in self.cache.items()]
+        scored = [(cosine(qvec, self.emb_by_sha[sha]), sha) for sha in self.chunk_by_sha]
         scored.sort(key=lambda x: x[0], reverse=True)
 
         top = scored[:self.max_results]
 
-        if not top:
-            return []
-
-        shas = [sha for _, sha in top]
-        placeholders = ",".join("?" * len(shas))
-        data_by_sha = {
-            sha: data
-            for sha, data in self.db.execute(
-                f"SELECT sha, data FROM chunks WHERE sha IN ({placeholders})",
-                shas,
-            )
-        }
-
-        paths_by_sha: dict[str, list[str]] = {}
-
-        for sha, path in self.db.execute(
-            f"SELECT sha, path FROM paths WHERE sha IN ({placeholders})",
-            shas,
-        ):
-            paths_by_sha.setdefault(sha, []).append(path)
-
         return [
-            {"paths": paths_by_sha.get(sha, []), "data": data_by_sha.get(sha, ""), "rank": sim}
+            {
+                "paths": self.paths_by_sha.get(sha, []),
+                "data": self.chunk_by_sha[sha],
+                "rank": sim,
+            }
             for sim, sha in top
-            if sha in data_by_sha
         ]
 
     @property
     def size(self) -> int:
-        return len(self.cache)
+        return len(self.chunk_by_sha)
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import claudex.search as search_mod
 
 RESET = "\033[0m"
 DIM = "\033[2m"
+RED = "\033[31m"
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
 MAGENTA = "\033[35m"
@@ -38,11 +39,15 @@ def cmd_search(args: argparse.Namespace):
         hits = s.search(query, 10)
 
         for h in hits:
-            src_c = SOURCE_COLORS.get(h["source"], "")
-            eng_c = ENGINE_COLORS.get(h["engine"], "")
-            paths = ", ".join(f"{src_c}{p}{RESET}" for p in h["paths"])
-            print(f"{DIM}[rrf={h['rank']:.4f} raw={h['raw_score']:.3f}]{RESET} {eng_c}{h['engine']}{RESET} {paths}")
-            print(h["data"])
+            print(f"{RED}[rrf={h['rank']:.4f}]{RESET}")
+
+            for m in h["members"]:
+                src_c = SOURCE_COLORS.get(m["source"], "")
+                eng_c = ENGINE_COLORS.get(m["engine"], "")
+                paths = ", ".join(f"{src_c}{p}{RESET}" for p in m["paths"])
+                print(f"{DIM}[raw={m['raw_score']:.3f}]{RESET} {eng_c}{m['engine']}{RESET} {paths}")
+                print(m["data"])
+
             print(f"{DIM}---{RESET}")
 
         print("> ", end="", file=sys.stderr, flush=True)
