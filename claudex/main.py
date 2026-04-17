@@ -8,6 +8,7 @@ import argparse
 
 import claudex.cmd_anal as ca
 import claudex.cmd_serve as cs
+import claudex.cmd_test as ct
 import claudex.cmd_models as cm
 import claudex.cmd_search as csh
 
@@ -24,6 +25,8 @@ def _dispatch(args):
         ca.cmd_anal(args)
     elif args.command == "search":
         csh.cmd_search(args)
+    elif args.command == "test":
+        ct.cmd_test(args)
 
 
 def main():
@@ -44,6 +47,8 @@ def main():
 
     p_search = sub.add_parser("search", help="Interactive search (stdin -> top-10 hits across engines)")
     p_search.add_argument("config", help="Path to config.json")
+
+    sub.add_parser("test", help="Run in-module self-tests")
 
     args = parser.parse_args()
 

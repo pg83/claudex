@@ -45,3 +45,71 @@ def connect_by_shared_elements(sets: list[frozenset]) -> list[list[int]]:
             cc.union(first, other)
 
     return cc.groups()
+
+
+def _norm(groups: list[list[int]]) -> list[list[int]]:
+    return sorted(sorted(g) for g in groups)
+
+
+def test():
+    # DSU: empty
+    assert ConnectedComponents(0).groups() == []
+
+    # DSU: single element
+    assert ConnectedComponents(1).groups() == [[0]]
+
+    # DSU: fully disconnected
+    assert _norm(ConnectedComponents(3).groups()) == [[0], [1], [2]]
+
+    # DSU: direct union
+    cc = ConnectedComponents(3)
+    cc.union(0, 1)
+    assert _norm(cc.groups()) == [[0, 1], [2]]
+
+    # DSU: transitive union
+    cc = ConnectedComponents(4)
+    cc.union(0, 1)
+    cc.union(2, 3)
+    cc.union(1, 2)
+    assert _norm(cc.groups()) == [[0, 1, 2, 3]]
+
+    # DSU: chain collapses to one root
+    cc = ConnectedComponents(5)
+
+    for i in range(4):
+        cc.union(i, i + 1)
+
+    root = cc.find(0)
+
+    for i in range(5):
+        assert cc.find(i) == root
+
+    # shared-elements: empty input
+    assert connect_by_shared_elements([]) == []
+
+    # shared-elements: no overlap
+    got = connect_by_shared_elements([
+        frozenset(["a"]), frozenset(["b"]), frozenset(["c"]),
+    ])
+    assert _norm(got) == [[0], [1], [2]]
+
+    # shared-elements: direct overlap
+    got = connect_by_shared_elements([
+        frozenset(["a", "b"]),
+        frozenset(["b", "c"]),
+        frozenset(["x"]),
+    ])
+    assert _norm(got) == [[0, 1], [2]]
+
+    # shared-elements: transitive (0-1 via "b", 1-2 via "c")
+    got = connect_by_shared_elements([
+        frozenset(["a", "b"]),
+        frozenset(["b", "c"]),
+        frozenset(["c", "d"]),
+        frozenset(["z"]),
+    ])
+    assert _norm(got) == [[0, 1, 2], [3]]
+
+    # shared-elements: same set twice collapses
+    got = connect_by_shared_elements([frozenset(["a"]), frozenset(["a"])])
+    assert _norm(got) == [[0, 1]]
