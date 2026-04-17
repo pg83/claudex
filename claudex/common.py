@@ -75,6 +75,7 @@ def load_config(path: str) -> dict:
 
     for role, ep in cfg.get("endpoints", {}).items():
         base_url = _expand_env(ep.get("base_url", ""))
+
         endpoints[role] = {
             "base_url": base_url,
             "model": _expand_env(ep.get("model", "")),

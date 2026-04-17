@@ -30,9 +30,9 @@
       {
         "type": "rag",
         "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
-        "chunk_size": 1000,
+        "chunk_size": 5000,
         "max_results": 2,
-        "db": "~/.cache/claudex/$RANDOM.db",
+        "db": "~/.cache/claudex/V1.db",
         "embed_url": "http://10.0.0.227:11434/api/embed",
         "embed_model": "nomic-embed-text"
       }

@@ -18,6 +18,8 @@ SOURCE_COLORS = {
     "fs": CYAN,
     "conversation": YELLOW,
 }
+
+
 ENGINE_COLORS = {
     "rag": GREEN,
     "whoosh": MAGENTA,
@@ -32,6 +34,7 @@ def cmd_search(args: argparse.Namespace):
         f"{src}: {sum(e.size for e in engines)} [{','.join(e.type_name for e in engines)}]"
         for src, engines in s.engines_by_source.items()
     )
+
     print(f"Search: {sizes}", file=sys.stderr)
     print("> ", end="", file=sys.stderr, flush=True)
 
@@ -40,6 +43,7 @@ def cmd_search(args: argparse.Namespace):
 
         if not query:
             print("> ", end="", file=sys.stderr, flush=True)
+
             continue
 
         hits = s.search(query, 10)
@@ -51,6 +55,7 @@ def cmd_search(args: argparse.Namespace):
                 src_c = SOURCE_COLORS.get(m["source"], "")
                 eng_c = ENGINE_COLORS.get(m["engine"], "")
                 paths = ", ".join(f"{src_c}{p}{RESET}" for p in m["paths"])
+
                 print(f"{DIM}[raw={m['raw_score']:.3f}]{RESET} {eng_c}{m['engine']}{RESET} {paths}")
                 print(m["data"])
 
