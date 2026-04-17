@@ -56,7 +56,13 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
-## 5. Code Style
+## 5. Tests
+
+**Run `./cx test` before every commit.** If tests fail, fix them before committing — don't skip, don't disable.
+
+For new code components (a module, a standalone function, a class with non-trivial logic), add a free `test()` function in the same module covering the obvious cases and register the module in `claudex/cmd_test.py::MODULES`. Trivial glue code (a one-line wrapper, a subcommand dispatcher) doesn't need tests.
+
+## 6. Code Style
 
 **Imports.** Imports are split into three sections separated by blank lines: plain `import X` first (sorted by line length), then `from X import Y` lines (unrelated modules separated by blank lines, imports sharing a parent package grouped contiguously and sorted by module name length), then local modules last as `import claudex.X as alias`.
 

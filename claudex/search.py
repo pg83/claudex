@@ -8,7 +8,7 @@ import sqlite3
 
 from typing import Callable
 
-import claudex.con_com as cc
+import claudex.rrf as rrf
 
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox", ".mypy_cache"}
@@ -304,33 +304,6 @@ def make_engine(cfg: dict):
     return cls(cfg)
 
 
-def rrf_fuse(raw_hits: list[dict], k: int = 60, limit: int = None) -> list[dict]:
-    groups = cc.connect_by_shared_elements([h["paths"] for h in raw_hits])
-    fused = []
-
-    for indices in groups:
-        members = [raw_hits[i] for i in indices]
-        rank = sum(1.0 / (k + m["pos"] + 1) for m in members)
-        paths: frozenset = frozenset().union(*(m["paths"] for m in members))
-        shortest = min(members, key=lambda m: len(m["data"]))
-
-        fused.append({
-            "paths": sorted(paths),
-            "data": shortest["data"],
-            "source": shortest["source"],
-            "engine": shortest["engine"],
-            "raw_score": shortest["raw_score"],
-            "rank": rank,
-        })
-
-    fused.sort(key=lambda r: -r["rank"])
-
-    if limit is not None:
-        fused = fused[:limit]
-
-    return fused
-
-
 class Search:
     def __init__(self, cfg: dict):
         self.engines_by_source: dict[str, list] = {}
@@ -363,4 +336,9 @@ class Search:
                         "pos": pos,
                     })
 
-        return rrf_fuse(raw_hits, limit=limit)
+        fused = rrf.fuse(raw_hits)
+
+        if limit is not None:
+            fused = fused[:limit]
+
+        return fused
