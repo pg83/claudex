@@ -8,6 +8,8 @@ import sqlite3
 
 from typing import Callable
 
+import claudex.con_com as cc
+
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".tox", ".mypy_cache"}
 DEFAULT_EXTENSIONS = {
@@ -71,7 +73,7 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 def walk_files(cfg: dict):
-    dirs = [os.path.expanduser(d) for d in cfg.get("dirs", [])]
+    dirs = [os.path.expanduser(d) for d in cfg["dirs"]]
     extensions = set(cfg["extensions"]) if cfg.get("extensions") else DEFAULT_EXTENSIONS
 
     for directory in dirs:
@@ -302,6 +304,33 @@ def make_engine(cfg: dict):
     return cls(cfg)
 
 
+def rrf_fuse(raw_hits: list[dict], k: int = 60, limit: int = None) -> list[dict]:
+    groups = cc.connect_by_shared_elements([h["paths"] for h in raw_hits])
+    fused = []
+
+    for indices in groups:
+        members = [raw_hits[i] for i in indices]
+        rank = sum(1.0 / (k + m["pos"] + 1) for m in members)
+        paths: frozenset = frozenset().union(*(m["paths"] for m in members))
+        shortest = min(members, key=lambda m: len(m["data"]))
+
+        fused.append({
+            "paths": sorted(paths),
+            "data": shortest["data"],
+            "source": shortest["source"],
+            "engine": shortest["engine"],
+            "raw_score": shortest["raw_score"],
+            "rank": rank,
+        })
+
+    fused.sort(key=lambda r: -r["rank"])
+
+    if limit is not None:
+        fused = fused[:limit]
+
+    return fused
+
+
 class Search:
     def __init__(self, cfg: dict):
         self.engines_by_source: dict[str, list] = {}
@@ -316,9 +345,8 @@ class Search:
             engine.add(path, text)
 
     def search(self, query: str, limit: int = None, exclude_paths: list[str] = None) -> list[dict]:
-        k = 60
         excluded = set(exclude_paths or [])
-        hits = []
+        raw_hits = []
 
         for source, engines in self.engines_by_source.items():
             for engine in engines:
@@ -326,21 +354,13 @@ class Search:
                     if excluded and any(p in excluded for p in h["paths"]):
                         continue
 
-                    hits.append({
-                        "paths": h["paths"],
+                    raw_hits.append({
+                        "paths": frozenset(h["paths"]),
                         "data": h["data"],
                         "source": source,
                         "engine": engine.type_name,
                         "raw_score": h["rank"],
-                        "rank": 1.0 / (k + pos + 1),
+                        "pos": pos,
                     })
 
-        hits.sort(key=lambda r: -r["rank"])
-
-        if hits:
-            hits = hits[1:]
-
-        if limit is not None:
-            hits = hits[:limit]
-
-        return hits
+        return rrf_fuse(raw_hits, limit=limit)
