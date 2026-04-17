@@ -19,6 +19,7 @@ FALLBACK_CHAIN = {
 def _expand_env(s: str) -> str:
     if not isinstance(s, str):
         return s
+
     return re.sub(r'\$([A-Za-z_][A-Za-z0-9_]*)', lambda m: os.environ.get(m.group(1), m.group(0)), s)
 
 
@@ -27,16 +28,20 @@ _ANTHROPIC_HOSTS = ("anthropic.com",)
 
 def _infer_protocol(base_url: str) -> str:
     host = (urlparse(base_url).hostname or "").lower()
+
     if any(host == h or host.endswith("." + h) for h in _ANTHROPIC_HOSTS):
         return "anthropic"
+
     return "openai"
 
 
 def _strip_chat_suffix(url: str) -> str:
     base = url.rstrip("/")
+
     for suffix in ("/chat/completions", "/chat/completion"):
         if base.endswith(suffix):
             return base[: -len(suffix)].rstrip("/")
+
     return base
 
 

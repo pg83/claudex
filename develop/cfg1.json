@@ -26,21 +26,15 @@
         "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
         "max_results": 5,
         "snippet_chars": 200
-      }
-    ],
-
-    "conversation": [
+      },
       {
         "type": "rag",
-        "chunk_size": 500,
+        "dirs": ["/home/pg/repos/claudex", "/home/pg/repos/std"],
+        "chunk_size": 1000,
         "max_results": 2,
         "db": "~/.cache/claudex/$RANDOM.db",
         "embed_url": "http://10.0.0.227:11434/api/embed",
         "embed_model": "nomic-embed-text"
-      },
-      {
-        "type": "whoosh",
-        "max_results": 2
       }
     ]
   }
