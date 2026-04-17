@@ -82,6 +82,30 @@ def load_config(path: str) -> dict:
     return config
 
 
+def extract_text_content(content) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+
+        return " ".join(texts)
+
+    return ""
+
+
+def extract_system_text(system) -> str:
+    if isinstance(system, str):
+        return system
+
+    if isinstance(system, list):
+        return "\n\n".join(
+            block["text"] for block in system if block.get("type") == "text"
+        )
+
+    return str(system) if system else ""
+
+
 def resolve_endpoint(config: dict, name: str) -> dict:
     """Resolve a role name or Anthropic model name to an endpoint dict.
 

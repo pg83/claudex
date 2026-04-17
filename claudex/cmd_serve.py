@@ -3,6 +3,7 @@ import sys
 import json
 import httpx
 import signal
+import hashlib
 import uvicorn
 import argparse
 
@@ -20,9 +21,100 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex.log as lg
 import claudex.common as cx
-import claudex.proto_common as pc
 import claudex.upper_openai as uo
 import claudex.upper_anthropic as ua
+
+
+# ---------------------------------------------------------------------------
+# Proxy-handled tools
+# ---------------------------------------------------------------------------
+
+PROXY_HANDLED_TOOLS = {"WebFetch", "WebSearch", "web_search"}
+
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+
+def session_id(messages: list) -> str:
+    for m in messages:
+        if m.get("role") == "user":
+            text = cx.extract_text_content(m.get("content", ""))
+
+            if text:
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+    return "nosess"
+
+
+def count_content_chars(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+
+    if isinstance(content, list):
+        total = 0
+
+        for block in content:
+            btype = block.get("type", "")
+
+            if btype == "text":
+                total += len(block.get("text", ""))
+            elif btype == "tool_result":
+                sub = block.get("content", "")
+
+                if isinstance(sub, str):
+                    total += len(sub)
+                elif isinstance(sub, list):
+                    for sb in sub:
+                        total += len(sb.get("text", ""))
+            elif btype == "tool_use":
+                total += len(json.dumps(block.get("input", {})))
+
+        return total
+
+    return 0
+
+
+def extract_proxy_tool_uses(anthropic_resp: dict) -> list:
+    return [
+        b for b in anthropic_resp.get("content", [])
+        if b.get("type") == "tool_use" and b.get("name") in PROXY_HANDLED_TOOLS
+    ]
+
+
+async def debug_stream_wrap(gen: AsyncIterator[str], config: dict, req_id: str) -> AsyncIterator[str]:
+    async for event_str in gen:
+        lg.debug_sse(config, "out", event_str, req_id=req_id)
+
+        yield event_str
+
+
+def error_response(status_code: int, etype: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={
+        "type": "error",
+        "error": {"type": etype, "message": message},
+    })
+
+
+def translate_openai_error(status_code: int, openai_error: Optional[dict] = None) -> JSONResponse:
+    error_msg = "Unknown error"
+
+    if openai_error and "error" in openai_error:
+        err = openai_error["error"]
+        error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+
+    if status_code == 429:
+        etype = "rate_limit_error"
+    elif status_code == 401:
+        etype = "authentication_error"
+    elif status_code >= 500:
+        status_code = 529
+        etype = "overloaded_error"
+    else:
+        status_code = 400
+        etype = "invalid_request_error"
+
+    return error_response(status_code, etype, error_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +161,7 @@ class ProxyServer:
         if name == "WebFetch":
             url = tool_input.get("url", "")
             lg.log(f"web_fetch {url}", sid=sid)
-            resp = await self.client().get(url, headers=pc.FETCH_HEADERS, timeout=15, follow_redirects=True)
+            resp = await self.client().get(url, headers=FETCH_HEADERS, timeout=15, follow_redirects=True)
             result = resp.text
             lg.debug_log(self.config, "TOOL EXECUTE", {"name": name, "input": tool_input, "output": result}, req_id=req_id)
 
@@ -82,7 +174,7 @@ class ProxyServer:
             resp = await self.client().get(
                 "https://html.duckduckgo.com/html/",
                 params={"q": query},
-                headers=pc.FETCH_HEADERS,
+                headers=FETCH_HEADERS,
                 timeout=15,
                 follow_redirects=True,
             )
@@ -102,9 +194,9 @@ class ProxyServer:
         try:
             body = await request.json()
         except Exception:
-            return pc.error_response(400, "invalid_request_error", "Invalid JSON body")
+            return error_response(400, "invalid_request_error", "Invalid JSON body")
 
-        sid = pc.session_id(body.get("messages", []))
+        sid = session_id(body.get("messages", []))
         anthropic_model = body.get("model", "")
         is_stream = body.get("stream", False)
         ep = cx.resolve_endpoint(self.config, anthropic_model)
@@ -139,13 +231,13 @@ class ProxyServer:
             lg.log(f"ERROR {e.response.status_code}", sid=sid)
             lg.debug_log(self.config, "UPSTREAM ERROR", error_body, req_id=req_id, sid=sid, status=e.response.status_code)
 
-            return pc.translate_openai_error(e.response.status_code, error_body)
+            return translate_openai_error(e.response.status_code, error_body)
 
         except Exception as e:
             lg.log(f"ERROR {e}", sid=sid)
             lg.debug_log(self.config, "PROXY ERROR", {"error": str(e)}, req_id=req_id, sid=sid)
 
-            return pc.error_response(500, "api_error", str(e))
+            return error_response(500, "api_error", str(e))
 
     async def _lower_handle(self, upper, body: dict, anthropic_model: str, sid: str, req_id: str, client_headers, is_stream: bool):
         proto = type(upper).__name__
@@ -156,7 +248,7 @@ class ProxyServer:
             iterator = await upper.stream(body, client_headers, sid)
 
             return StreamingResponse(
-                pc.debug_stream_wrap(iterator, self.config, req_id),
+                debug_stream_wrap(iterator, self.config, req_id),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -171,7 +263,7 @@ class ProxyServer:
             lg.debug_log(self.config, "UPSTREAM RESPONSE", resp, req_id=req_id, sid=sid, proto=proto,
                       stop=resp.get("stop_reason"))
 
-            proxy_uses = pc.extract_proxy_tool_uses(resp)
+            proxy_uses = extract_proxy_tool_uses(resp)
 
             if not proxy_uses:
                 break
@@ -211,10 +303,10 @@ class ProxyServer:
         except Exception:
             return JSONResponse(content={"input_tokens": 0})
 
-        total_chars = len(pc.extract_system_text(body.get("system")))
+        total_chars = len(cx.extract_system_text(body.get("system")))
 
         for msg in body.get("messages", []):
-            total_chars += pc.count_content_chars(msg.get("content", ""))
+            total_chars += count_content_chars(msg.get("content", ""))
 
         if "tools" in body:
             total_chars += len(json.dumps(body["tools"]))

@@ -6,11 +6,34 @@ from typing import AsyncIterator, Optional, Union
 
 import claudex.log as lg
 import claudex.common as cx
-import claudex.proto_common as pc
 
 
 def chat_url(base_url: str) -> str:
     return cx._strip_chat_suffix(base_url) + "/chat/completions"
+
+
+def to_anthropic_tool_id(openai_id: str) -> str:
+    if openai_id.startswith("call_"):
+        return "toolu_" + openai_id[5:]
+
+    return openai_id
+
+
+def to_openai_tool_id(anthropic_id: str) -> str:
+    if anthropic_id.startswith("toolu_"):
+        return "call_" + anthropic_id[6:]
+
+    return anthropic_id
+
+
+def gen_message_id() -> str:
+    return "msg_" + uuid.uuid4().hex[:24]
+
+
+def sse_event(event_type: str, data: dict) -> str:
+    data.setdefault("type", event_type)
+
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +129,7 @@ def convert_user_msg(content) -> list[dict]:
     for tr in tool_results:
         result.append({
             "role": "tool",
-            "tool_call_id": pc.to_openai_tool_id(tr["tool_use_id"]),
+            "tool_call_id": to_openai_tool_id(tr["tool_use_id"]),
             "content": extract_tool_result_content(tr),
         })
 
@@ -134,7 +157,7 @@ def convert_assistant_msg(content) -> dict:
                 text_parts.append(block["text"])
             elif btype == "tool_use":
                 tool_calls.append({
-                    "id": pc.to_openai_tool_id(block["id"]),
+                    "id": to_openai_tool_id(block["id"]),
                     "type": "function",
                     "function": {
                         "name": block["name"],
@@ -160,7 +183,7 @@ def convert_request(body: dict, openai_model: str) -> dict:
 
     openai_messages: list[dict] = []
 
-    system_text = pc.extract_system_text(body.get("system"))
+    system_text = cx.extract_system_text(body.get("system"))
 
     if system_text:
         openai_messages.append({"role": "developer", "content": system_text})
@@ -255,7 +278,7 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
 
             content_blocks.append({
                 "type": "tool_use",
-                "id": pc.to_anthropic_tool_id(tc["id"]),
+                "id": to_anthropic_tool_id(tc["id"]),
                 "name": tc["function"]["name"],
                 "input": tool_input,
             })
@@ -267,7 +290,7 @@ def convert_response(openai_resp: dict, anthropic_model: str) -> dict:
     usage = openai_resp.get("usage", {})
 
     return {
-        "id": pc.gen_message_id(),
+        "id": gen_message_id(),
         "type": "message",
         "role": "assistant",
         "content": content_blocks,
@@ -313,7 +336,7 @@ class StreamState:
     )
 
     def __init__(self, anthropic_model: str):
-        self.message_id = pc.gen_message_id()
+        self.message_id = gen_message_id()
         self.anthropic_model = anthropic_model
         self.block_index = 0
         self.current_block_type: Optional[str] = None
@@ -329,12 +352,12 @@ def close_block_events(state: StreamState) -> list[str]:
     events: list[str] = []
 
     if state.current_block_type == "thinking":
-        events.append(pc.sse_event("content_block_delta", {
+        events.append(sse_event("content_block_delta", {
             "index": state.block_index,
             "delta": {"type": "signature_delta", "signature": ""},
         }))
 
-    events.append(pc.sse_event("content_block_stop", {
+    events.append(sse_event("content_block_stop", {
         "index": state.block_index,
     }))
 
@@ -352,7 +375,7 @@ def open_block_events(state: StreamState, block_type: str, content_block: dict) 
     events = close_block_events(state)
     state.current_block_type = block_type
 
-    events.append(pc.sse_event("content_block_start", {
+    events.append(sse_event("content_block_start", {
         "index": state.block_index,
         "content_block": content_block,
     }))
@@ -368,7 +391,7 @@ async def stream_translate(
 ) -> AsyncIterator[str]:
     state = StreamState(anthropic_model)
 
-    yield pc.sse_event("message_start", {
+    yield sse_event("message_start", {
         "message": {
             "id": state.message_id,
             "type": "message",
@@ -381,7 +404,7 @@ async def stream_translate(
         },
     })
 
-    yield pc.sse_event("ping", {})
+    yield sse_event("ping", {})
 
     finish_reason = None
     chunk_count = 0
@@ -413,7 +436,7 @@ async def stream_translate(
                     for ev in open_block_events(state, "thinking", {"type": "thinking", "thinking": ""}):
                         yield ev
 
-                    yield pc.sse_event("content_block_delta", {
+                    yield sse_event("content_block_delta", {
                         "index": state.block_index,
                         "delta": {"type": "thinking_delta", "thinking": reasoning},
                     })
@@ -424,7 +447,7 @@ async def stream_translate(
                     for ev in open_block_events(state, "text", {"type": "text", "text": ""}):
                         yield ev
 
-                    yield pc.sse_event("content_block_delta", {
+                    yield sse_event("content_block_delta", {
                         "index": state.block_index,
                         "delta": {"type": "text_delta", "text": text},
                     })
@@ -439,12 +462,12 @@ async def stream_translate(
                             for ev in close_block_events(state):
                                 yield ev
 
-                            tool_id = pc.to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
+                            tool_id = to_anthropic_tool_id(tc_delta.get("id", f"call_{uuid.uuid4().hex[:8]}"))
                             tool_name = tc_delta.get("function", {}).get("name", "")
                             state.current_block_type = "tool_use"
                             state.current_tool_index = tc_idx
 
-                            yield pc.sse_event("content_block_start", {
+                            yield sse_event("content_block_start", {
                                 "index": state.block_index,
                                 "content_block": {
                                     "type": "tool_use", "id": tool_id, "name": tool_name, "input": {},
@@ -454,7 +477,7 @@ async def stream_translate(
                         args_chunk = tc_delta.get("function", {}).get("arguments", "")
 
                         if args_chunk:
-                            yield pc.sse_event("content_block_delta", {
+                            yield sse_event("content_block_delta", {
                                 "index": state.block_index,
                                 "delta": {"type": "input_json_delta", "partial_json": args_chunk},
                             })
@@ -472,12 +495,12 @@ async def stream_translate(
 
     stop_reason = FINISH_REASON_MAP.get(finish_reason, "end_turn")
 
-    yield pc.sse_event("message_delta", {
+    yield sse_event("message_delta", {
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
         "usage": {"output_tokens": state.output_tokens},
     })
 
-    yield pc.sse_event("message_stop", {})
+    yield sse_event("message_stop", {})
 
     lg.log(f"done | {state.input_tokens}in/{state.output_tokens}out | {stop_reason}",
         sid=sid)
