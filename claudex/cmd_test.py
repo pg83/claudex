@@ -5,10 +5,11 @@ import argparse
 import traceback
 
 import claudex.rrf as rrf
+import claudex.search as search
 import claudex.con_com as con_com
 
 
-MODULES = [con_com, rrf]
+MODULES = [con_com, rrf, search]
 
 
 def cmd_test(args: argparse.Namespace):

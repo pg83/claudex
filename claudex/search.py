@@ -342,3 +342,54 @@ class Search:
             fused = fused[:limit]
 
         return fused
+
+
+def test():
+    import io
+    import tempfile
+    import contextlib
+
+    with tempfile.TemporaryDirectory() as d:
+        alpha = os.path.join(d, "alpha.txt")
+        beta = os.path.join(d, "beta.txt")
+
+        with open(alpha, "w") as f:
+            f.write("the quick brown fox jumps over the lazy dog")
+
+        with open(beta, "w") as f:
+            f.write("another fox appears at dawn beneath silver moons")
+
+        cfg = {"dirs": [d], "max_results": 5, "snippet_chars": 100, "extensions": [".txt"]}
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            engine = WhooshEngine(cfg)
+
+        assert engine.size == 2
+
+        hits = engine.search("fox")
+        paths = {h["paths"][0] for h in hits}
+        assert alpha in paths
+        assert beta in paths
+
+        for h in hits:
+            assert isinstance(h["paths"], list) and len(h["paths"]) == 1
+            assert isinstance(h["data"], str) and h["data"]
+            assert isinstance(h["rank"], float)
+
+        hits = engine.search("quick brown")
+        assert [h["paths"][0] for h in hits][0] == alpha
+
+        hits = engine.search("dawn")
+        assert [h["paths"][0] for h in hits] == [beta]
+
+        assert engine.search("zzzzznotfound") == []
+
+        # add() indexes new docs
+        gamma = "/synthetic/gamma.txt"
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            engine.add(gamma, "a unique sentinel token: kumquat")
+
+        assert engine.size == 3
+        hits = engine.search("kumquat")
+        assert [h["paths"][0] for h in hits] == [gamma]
