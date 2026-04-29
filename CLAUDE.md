@@ -1,5 +1,9 @@
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## Coding conventions
+
+- Git author: `claude <claude@users.noreply.github.com>`. Commit messages in English.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
